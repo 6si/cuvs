@@ -284,6 +284,12 @@ cdef class IndexParams:
         Parameters for ACE algorithm. If provided, it will be used for
         building the graph with ACE partitioning.
     refinement_rate: float, default = 1.0
+        Rate of refinement for the IVF-PQ graph build. When > 1.0, more
+        approximate candidates are retrieved and re-ranked with exact
+        distances. When left at the default of 1.0, the C++ layer
+        automatically uses refinement_rate=2.0 for inner_product and
+        cosine metrics (which are more sensitive to PQ quantization
+        errors).
 
     """
 

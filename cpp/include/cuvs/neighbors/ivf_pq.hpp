@@ -3430,7 +3430,15 @@ struct ivf_pq_params {
     search_params.coarse_search_dtype     = CUDA_R_16F;
     search_params.max_internal_batch_size = 128 * 1024;
 
-    refinement_rate = 1;
+    // Inner product and cosine metrics are more sensitive to PQ quantization
+    // errors (especially with 4-bit PQ and fp16 distances). Use refinement to
+    // re-rank candidates with exact distances, improving KNN graph quality.
+    if (metric == cuvs::distance::DistanceType::InnerProduct ||
+        metric == cuvs::distance::DistanceType::CosineExpanded) {
+      refinement_rate = 2.0f;
+    } else {
+      refinement_rate = 1.0f;
+    }
   }
 };
 }  // namespace graph_build_params
