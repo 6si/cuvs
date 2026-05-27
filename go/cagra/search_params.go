@@ -5,6 +5,7 @@ import "C"
 
 import (
 	"errors"
+	"unsafe"
 
 	cuvs "github.com/rapidsai/cuvs/go"
 )
@@ -150,6 +151,16 @@ func (p *SearchParams) SetNumRandomSamplings(num_random_samplings uint32) (*Sear
 // Bit mask used for initial random seed node selection.
 func (p *SearchParams) SetRandXorMask(rand_xor_mask uint64) (*SearchParams, error) {
 	p.params.rand_xor_mask = C.uint64_t(rand_xor_mask)
+	return p, nil
+}
+
+// Set seed indices for initial entry points (device pointer).
+// Shape: [n_queries, num_seeds]. When provided, these are used instead of
+// random seeds, which can significantly improve recall for large datasets.
+// The pointer must point to valid device memory for the duration of the search.
+func (p *SearchParams) SetSeedIndices(seed_indices uintptr, num_seed_indices uint32) (*SearchParams, error) {
+	p.params.seed_indices = (*C.uint32_t)(unsafe.Pointer(seed_indices))
+	p.params.num_seed_indices = C.uint32_t(num_seed_indices)
 	return p, nil
 }
 

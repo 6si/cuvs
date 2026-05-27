@@ -474,6 +474,8 @@ void convert_c_search_params(cuvsCagraSearchParams params,
   out->persistent            = params.persistent;
   out->persistent_lifetime   = params.persistent_lifetime;
   out->persistent_device_usage = params.persistent_device_usage;
+  out->seed_indices          = params.seed_indices;
+  out->num_seed_indices      = params.num_seed_indices;
 }
 }  // namespace cuvs::neighbors::cagra
 extern "C" cuvsError_t cuvsCagraIndexCreate(cuvsCagraIndex_t* index)
@@ -856,6 +858,8 @@ extern "C" cuvsError_t cuvsCagraSearchParamsCreate(cuvsCagraSearchParams_t* para
       .persistent              = false,
       .persistent_lifetime     = 2,
       .persistent_device_usage = 1.0,
+      .seed_indices            = nullptr,
+      .num_seed_indices        = 0,
     };
   });
 }

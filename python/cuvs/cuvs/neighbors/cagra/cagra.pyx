@@ -805,7 +805,8 @@ def search(SearchParams search_params,
            neighbors=None,
            distances=None,
            resources=None,
-           filter=None):
+           filter=None,
+           seed_indices=None):
     """
     Find the k nearest neighbors for each query.
 
@@ -827,6 +828,13 @@ def search(SearchParams search_params,
                 neighbors will be written here in-place. (default None)
     filter:     Optional cuvs.neighbors.cuvsFilter can be used to filter
                 neighbors based on a given bitset.
+                (default None)
+    seed_indices : Optional CUDA array interface compliant matrix shape
+                (n_queries, num_seeds), dtype uint32. If supplied, these
+                node indices are used as initial entry points for graph
+                traversal instead of random seeds. This can significantly
+                improve recall for large datasets when seeds come from a
+                coarse search (e.g., IVF-Flat or IVF-PQ).
                 (default None)
     {resources_docstring}
 
@@ -890,6 +898,21 @@ def search(SearchParams search_params,
         filter = no_filter()
 
     cdef cuvsCagraSearchParams* params = search_params.params
+
+    cdef uintptr_t seed_ptr = 0
+    cdef uint32_t num_seeds = 0
+    if seed_indices is not None:
+        seed_cai = wrap_array(seed_indices)
+        _check_input_array(seed_cai, [np.dtype('uint32')],
+                           exp_rows=n_queries)
+        seed_ptr = seed_cai.data
+        num_seeds = seed_cai.shape[1]
+        params.seed_indices = <const uint32_t*>seed_ptr
+        params.num_seed_indices = num_seeds
+    else:
+        params.seed_indices = NULL
+        params.num_seed_indices = 0
+
     cdef cydlpack.DLManagedTensor* queries_dlpack = \
         cydlpack.dlpack_c(queries_cai)
     cdef cydlpack.DLManagedTensor* neighbors_dlpack = \

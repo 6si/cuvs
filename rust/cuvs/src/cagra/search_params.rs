@@ -120,6 +120,23 @@ impl SearchParams {
         }
         self
     }
+
+    /// Set seed indices for initial entry points (device pointer).
+    /// Shape: [n_queries, num_seeds]. When provided, these are used instead of
+    /// random seeds, which can significantly improve recall for large datasets.
+    ///
+    /// # Safety
+    /// The pointer must point to valid device memory of shape [n_queries, num_seeds]
+    /// and must remain valid for the duration of the search call.
+    pub unsafe fn set_seed_indices(
+        self,
+        seed_indices: *const u32,
+        num_seed_indices: u32,
+    ) -> SearchParams {
+        (*self.0).seed_indices = seed_indices;
+        (*self.0).num_seed_indices = num_seed_indices;
+        self
+    }
 }
 
 impl fmt::Debug for SearchParams {

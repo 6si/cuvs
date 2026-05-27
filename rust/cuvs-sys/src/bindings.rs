@@ -1393,10 +1393,14 @@ pub struct cuvsCagraSearchParams {
     pub persistent_lifetime: f32,
     #[doc = " Set the fraction of maximum grid size used by persistent kernel.\n Value 1.0 means the kernel grid size is maximum possible for the selected device.\n The value must be greater than 0.0 and not greater than 1.0.\n\n One may need to run other kernels alongside this persistent kernel. This parameter can\n be used to reduce the grid size of the persistent kernel to leave a few SMs idle.\n Note: running any other work on GPU alongside with the persistent kernel makes the setup\n fragile.\n   - Running another kernel in another thread usually works, but no progress guaranteed\n   - Any CUDA allocations block the context (this issue may be obscured by using pools)\n   - Memory copies to not-pinned host memory may block the context\n\n Even when we know there are no other kernels working at the same time, setting\n kDeviceUsage to 1.0 surprisingly sometimes hurts performance. Proceed with care.\n If you suspect this is an issue, you can reduce this number to ~0.9 without a significant\n impact on the throughput."]
     pub persistent_device_usage: f32,
+    #[doc = " Optional device pointer to seed node indices for initial entry points."]
+    pub seed_indices: *const u32,
+    #[doc = " Number of seed indices per query. Only used when seed_indices is not null."]
+    pub num_seed_indices: u32,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of cuvsCagraSearchParams"][::std::mem::size_of::<cuvsCagraSearchParams>() - 112usize];
+    ["Size of cuvsCagraSearchParams"][::std::mem::size_of::<cuvsCagraSearchParams>() - 128usize];
     ["Alignment of cuvsCagraSearchParams"]
         [::std::mem::align_of::<cuvsCagraSearchParams>() - 8usize];
     ["Offset of field: cuvsCagraSearchParams::max_queries"]
@@ -1431,6 +1435,10 @@ const _: () = {
         [::std::mem::offset_of!(cuvsCagraSearchParams, persistent_lifetime) - 100usize];
     ["Offset of field: cuvsCagraSearchParams::persistent_device_usage"]
         [::std::mem::offset_of!(cuvsCagraSearchParams, persistent_device_usage) - 104usize];
+    ["Offset of field: cuvsCagraSearchParams::seed_indices"]
+        [::std::mem::offset_of!(cuvsCagraSearchParams, seed_indices) - 112usize];
+    ["Offset of field: cuvsCagraSearchParams::num_seed_indices"]
+        [::std::mem::offset_of!(cuvsCagraSearchParams, num_seed_indices) - 120usize];
 };
 pub type cuvsCagraSearchParams_t = *mut cuvsCagraSearchParams;
 unsafe extern "C" {
