@@ -349,6 +349,18 @@ struct search_params : cuvs::neighbors::search_params {
    * negative, in which case the filtering rate is automatically calculated.
    */
   float filtering_rate = -1.0;
+
+  /** Optional device pointer to seed node indices for initial entry points.
+   * Shape: [n_queries, num_seed_indices] in row-major on device memory.
+   * When provided (non-null), these seed indices are used as initial entry points
+   * for the graph traversal instead of randomly generated seeds. This can significantly
+   * improve recall at large dataset sizes by providing seeds from a coarse search
+   * (e.g., IVF-Flat or IVF-PQ).
+   * The pointer must remain valid for the duration of the search call.
+   */
+  const uint32_t* seed_indices = nullptr;
+  /** Number of seed indices per query. Only used when seed_indices is not null. */
+  uint32_t num_seed_indices = 0;
 };
 
 /**

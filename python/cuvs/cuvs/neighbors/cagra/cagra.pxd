@@ -106,6 +106,8 @@ cdef extern from "cuvs/neighbors/cagra.h" nogil:
         bool persistent
         float persistent_lifetime
         float persistent_device_usage
+        const uint32_t* seed_indices
+        uint32_t num_seed_indices
 
     ctypedef cuvsCagraSearchParams* cuvsCagraSearchParams_t
 

@@ -81,6 +81,17 @@ void search_main_core(
 
   plan->check(topk);
 
+  // If user provided seed indices via search_params, copy them to the plan's device buffer
+  if (params.seed_indices != nullptr && params.num_seed_indices > 0) {
+    const auto total_seeds = static_cast<size_t>(queries.extent(0)) * params.num_seed_indices;
+    plan->dev_seed.resize(total_seeds, raft::resource::get_cuda_stream(res));
+    raft::copy(plan->dev_seed.data(),
+               reinterpret_cast<const IndexT*>(params.seed_indices),
+               total_seeds,
+               raft::resource::get_cuda_stream(res));
+    plan->num_seeds = params.num_seed_indices;
+  }
+
   RAFT_LOG_DEBUG("Cagra search");
   const uint32_t max_queries = plan->max_queries;
   const uint32_t query_dim   = queries.extent(1);

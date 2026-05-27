@@ -436,6 +436,14 @@ struct cuvsCagraSearchParams {
    * impact on the throughput.
    */
   float persistent_device_usage;
+
+  /** Optional device pointer to seed node indices for initial entry points.
+   * Shape: [n_queries, num_seed_indices] in row-major on device memory.
+   * When provided (non-null), these seed indices are used as initial entry points
+   * for the graph traversal instead of randomly generated seeds. */
+  const uint32_t* seed_indices;
+  /** Number of seed indices per query. Only used when seed_indices is not null. */
+  uint32_t num_seed_indices;
 };
 
 typedef struct cuvsCagraSearchParams* cuvsCagraSearchParams_t;
