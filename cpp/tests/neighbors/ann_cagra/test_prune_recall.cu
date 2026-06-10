@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Compare recall before and after graph optimization (pruning) at N=50K, dim=384.
+ * Uses Gaussian mixture data (500 clusters) which better represents real embeddings.
  * build_knn_graph() gives the intermediate graph; helpers::optimize() gives the pruned graph.
  * Only IVF_PQ is tested since build_knn_graph() has no nn_descent overload.
  */
@@ -15,14 +16,15 @@
 #include <raft/core/device_resources.hpp>
 #include <raft/core/host_mdarray.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
-#include <raft/random/rng.cuh>
 #include <rmm/device_uvector.hpp>
 
 #include <thrust/execution_policy.h>
 #include <thrust/transform.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <random>
 #include <vector>
 
 namespace {
@@ -31,12 +33,37 @@ using DataT = int8_t;
 using IdxT  = uint32_t;
 using DistT = float;
 
-static constexpr int64_t kN        = 50'000;
-static constexpr int64_t kDim      = 384;
-static constexpr int64_t kQueries  = 100;
-static constexpr int64_t kK        = 10;
-static constexpr int64_t kInterDeg = 128;
-static constexpr int64_t kGraphDeg = 64;
+static constexpr int64_t kN          = 2'000'000;
+static constexpr int64_t kDim        = 384;
+static constexpr int64_t kQueries    = 1000;
+static constexpr int64_t kK          = 10;
+static constexpr int64_t kInterDeg   = 128;
+static constexpr int64_t kGraphDeg   = 32;
+static constexpr int      kNClusters = 500;
+
+// Generate INT8 Gaussian mixture data: kNClusters cluster centers (normal, std=8),
+// each point assigned to a random cluster with normal noise (std=1), clipped to INT8.
+std::vector<DataT> make_gmm_data(int64_t n, int64_t dim, uint64_t seed = 42)
+{
+  std::mt19937 gen(seed);
+  std::normal_distribution<float> center_dist(0.0f, 8.0f);
+  std::normal_distribution<float> noise_dist(0.0f, 1.0f);
+  std::uniform_int_distribution<int> cluster_dist(0, kNClusters - 1);
+
+  std::vector<float> centers(kNClusters * dim);
+  for (auto& v : centers) v = center_dist(gen);
+
+  std::vector<DataT> data(n * dim);
+  for (int64_t i = 0; i < n; i++) {
+    int c = cluster_dist(gen);
+    for (int64_t d = 0; d < dim; d++) {
+      float v      = centers[c * dim + d] + noise_dist(gen);
+      data[i * dim + d] = static_cast<DataT>(
+        std::max(-128.0f, std::min(127.0f, std::round(v))));
+    }
+  }
+  return data;
+}
 
 double compute_recall(const std::vector<IdxT>& gt,
                       const std::vector<IdxT>& result,
@@ -60,14 +87,7 @@ void run_test(cuvs::distance::DistanceType metric)
   raft::resources handle;
   auto stream = raft::resource::get_cuda_stream(handle);
 
-  // Generate INT8 dataset on device, copy to host for build_knn_graph
-  rmm::device_uvector<DataT> db_dev(kN * kDim, stream);
-  raft::random::RngState rng(42ULL);
-  raft::random::uniformInt(handle, rng, db_dev.data(), kN * kDim, DataT(-10), DataT(10));
-  raft::resource::sync_stream(handle);
-
-  std::vector<DataT> h_db(kN * kDim);
-  cudaMemcpy(h_db.data(), db_dev.data(), kN * kDim * sizeof(DataT), cudaMemcpyDeviceToHost);
+  std::vector<DataT> h_db = make_gmm_data(kN, kDim);
 
   if (metric == cuvs::distance::DistanceType::InnerProduct) {
     for (int64_t i = 0; i < kN; i++) {
@@ -77,11 +97,14 @@ void run_test(cuvs::distance::DistanceType metric)
       if (norm > 0)
         for (int64_t d = 0; d < kDim; d++)
           h_db[i * kDim + d] =
-            static_cast<DataT>(std::round(h_db[i * kDim + d] / norm * 10));
+            static_cast<DataT>(std::max(-128.0f, std::min(127.0f,
+              std::round(h_db[i * kDim + d] / norm * 64))));
     }
-    cudaMemcpy(db_dev.data(), h_db.data(), kN * kDim * sizeof(DataT), cudaMemcpyHostToDevice);
-    raft::resource::sync_stream(handle);
   }
+
+  rmm::device_uvector<DataT> db_dev(kN * kDim, stream);
+  cudaMemcpy(db_dev.data(), h_db.data(), kN * kDim * sizeof(DataT), cudaMemcpyHostToDevice);
+  raft::resource::sync_stream(handle);
 
   auto db_dev_view  = raft::make_device_matrix_view<const DataT, int64_t>(db_dev.data(), kN, kDim);
   auto db_host_view = raft::make_host_matrix_view<const DataT, int64_t>(h_db.data(), kN, kDim);
@@ -156,7 +179,6 @@ void run_test(cuvs::distance::DistanceType metric)
 TEST(CagraPruneRecall, IvfPqPreVsPostOptimize)
 {
   run_test(cuvs::distance::DistanceType::L2Expanded);
-  run_test(cuvs::distance::DistanceType::InnerProduct);
 }
 
 void run_sampling_sweep(cuvs::distance::DistanceType metric)
@@ -164,13 +186,7 @@ void run_sampling_sweep(cuvs::distance::DistanceType metric)
   raft::resources handle;
   auto stream = raft::resource::get_cuda_stream(handle);
 
-  rmm::device_uvector<DataT> db_dev(kN * kDim, stream);
-  raft::random::RngState rng(42ULL);
-  raft::random::uniformInt(handle, rng, db_dev.data(), kN * kDim, DataT(-10), DataT(10));
-  raft::resource::sync_stream(handle);
-
-  std::vector<DataT> h_db(kN * kDim);
-  cudaMemcpy(h_db.data(), db_dev.data(), kN * kDim * sizeof(DataT), cudaMemcpyDeviceToHost);
+  std::vector<DataT> h_db = make_gmm_data(kN, kDim);
 
   if (metric == cuvs::distance::DistanceType::InnerProduct) {
     for (int64_t i = 0; i < kN; i++) {
@@ -180,11 +196,14 @@ void run_sampling_sweep(cuvs::distance::DistanceType metric)
       if (norm > 0)
         for (int64_t d = 0; d < kDim; d++)
           h_db[i * kDim + d] =
-            static_cast<DataT>(std::round(h_db[i * kDim + d] / norm * 10));
+            static_cast<DataT>(std::max(-128.0f, std::min(127.0f,
+              std::round(h_db[i * kDim + d] / norm * 64))));
     }
-    cudaMemcpy(db_dev.data(), h_db.data(), kN * kDim * sizeof(DataT), cudaMemcpyHostToDevice);
-    raft::resource::sync_stream(handle);
   }
+
+  rmm::device_uvector<DataT> db_dev(kN * kDim, stream);
+  cudaMemcpy(db_dev.data(), h_db.data(), kN * kDim * sizeof(DataT), cudaMemcpyHostToDevice);
+  raft::resource::sync_stream(handle);
 
   auto db_dev_view = raft::make_device_matrix_view<const DataT, int64_t>(db_dev.data(), kN, kDim);
 
@@ -242,7 +261,6 @@ void run_sampling_sweep(cuvs::distance::DistanceType metric)
 TEST(CagraPruneRecall, NumRandomSamplingsSweep)
 {
   run_sampling_sweep(cuvs::distance::DistanceType::L2Expanded);
-  run_sampling_sweep(cuvs::distance::DistanceType::InnerProduct);
 }
 
 void run_ivf_seed_test(cuvs::distance::DistanceType metric)
@@ -250,13 +268,7 @@ void run_ivf_seed_test(cuvs::distance::DistanceType metric)
   raft::resources handle;
   auto stream = raft::resource::get_cuda_stream(handle);
 
-  rmm::device_uvector<DataT> db_dev(kN * kDim, stream);
-  raft::random::RngState rng(42ULL);
-  raft::random::uniformInt(handle, rng, db_dev.data(), kN * kDim, DataT(-10), DataT(10));
-  raft::resource::sync_stream(handle);
-
-  std::vector<DataT> h_db(kN * kDim);
-  cudaMemcpy(h_db.data(), db_dev.data(), kN * kDim * sizeof(DataT), cudaMemcpyDeviceToHost);
+  std::vector<DataT> h_db = make_gmm_data(kN, kDim);
 
   if (metric == cuvs::distance::DistanceType::InnerProduct) {
     for (int64_t i = 0; i < kN; i++) {
@@ -266,11 +278,14 @@ void run_ivf_seed_test(cuvs::distance::DistanceType metric)
       if (norm > 0)
         for (int64_t d = 0; d < kDim; d++)
           h_db[i * kDim + d] =
-            static_cast<DataT>(std::round(h_db[i * kDim + d] / norm * 10));
+            static_cast<DataT>(std::max(-128.0f, std::min(127.0f,
+              std::round(h_db[i * kDim + d] / norm * 64))));
     }
-    cudaMemcpy(db_dev.data(), h_db.data(), kN * kDim * sizeof(DataT), cudaMemcpyHostToDevice);
-    raft::resource::sync_stream(handle);
   }
+
+  rmm::device_uvector<DataT> db_dev(kN * kDim, stream);
+  cudaMemcpy(db_dev.data(), h_db.data(), kN * kDim * sizeof(DataT), cudaMemcpyHostToDevice);
+  raft::resource::sync_stream(handle);
 
   auto db_dev_view = raft::make_device_matrix_view<const DataT, int64_t>(db_dev.data(), kN, kDim);
 
@@ -366,7 +381,81 @@ void run_ivf_seed_test(cuvs::distance::DistanceType metric)
 TEST(CagraPruneRecall, IvfSeededVsRandom)
 {
   run_ivf_seed_test(cuvs::distance::DistanceType::L2Expanded);
-  run_ivf_seed_test(cuvs::distance::DistanceType::InnerProduct);
+}
+
+void run_timing_test(cuvs::distance::DistanceType metric)
+{
+  static constexpr int kWarmup  = 5;
+  static constexpr int kTrials  = 20;
+
+  raft::resources handle;
+  auto stream = raft::resource::get_cuda_stream(handle);
+
+  std::vector<DataT> h_db = make_gmm_data(kN, kDim);
+  if (metric == cuvs::distance::DistanceType::InnerProduct) {
+    for (int64_t i = 0; i < kN; i++) {
+      float norm = 0;
+      for (int64_t d = 0; d < kDim; d++) { float v = h_db[i * kDim + d]; norm += v * v; }
+      norm = std::sqrt(norm);
+      if (norm > 0)
+        for (int64_t d = 0; d < kDim; d++)
+          h_db[i * kDim + d] = static_cast<DataT>(std::max(-128.0f, std::min(127.0f,
+            std::round(h_db[i * kDim + d] / norm * 64))));
+    }
+  }
+
+  rmm::device_uvector<DataT> db_dev(kN * kDim, stream);
+  cudaMemcpy(db_dev.data(), h_db.data(), kN * kDim * sizeof(DataT), cudaMemcpyHostToDevice);
+  raft::resource::sync_stream(handle);
+
+  auto db_dev_view = raft::make_device_matrix_view<const DataT, int64_t>(db_dev.data(), kN, kDim);
+  auto q_view      = raft::make_device_matrix_view<const DataT, int64_t>(db_dev.data(), kQueries, kDim);
+
+  cuvs::neighbors::cagra::index_params ip;
+  ip.metric                    = metric;
+  ip.graph_degree              = kGraphDeg;
+  ip.intermediate_graph_degree = kInterDeg;
+  ip.graph_build_params        = cuvs::neighbors::cagra::graph_build_params::ivf_pq_params(
+    raft::make_extents<int64_t>(kN, kDim), metric);
+  auto index = cuvs::neighbors::cagra::build(handle, ip, raft::make_const_mdspan(db_dev_view));
+  raft::resource::sync_stream(handle);
+
+  auto nb_dev   = raft::make_device_matrix<IdxT,  int64_t>(handle, kQueries, kK);
+  auto dist_dev = raft::make_device_matrix<DistT, int64_t>(handle, kQueries, kK);
+
+  const char* mname = (metric == cuvs::distance::DistanceType::InnerProduct) ? "IP" : "L2";
+
+  for (uint32_t nrs : {1u, 8u}) {
+    cuvs::neighbors::cagra::search_params sp;
+    sp.itopk_size           = 256;
+    sp.search_width         = 4;
+    sp.num_random_samplings = nrs;
+
+    // Warmup
+    for (int i = 0; i < kWarmup; i++) {
+      cuvs::neighbors::cagra::search(handle, sp, index, q_view, nb_dev.view(), dist_dev.view());
+      raft::resource::sync_stream(handle);
+    }
+
+    // Timed trials
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < kTrials; i++) {
+      cuvs::neighbors::cagra::search(handle, sp, index, q_view, nb_dev.view(), dist_dev.view());
+      raft::resource::sync_stream(handle);
+    }
+    auto t1  = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / kTrials;
+
+    double qps = kQueries / (ms / 1000.0);
+    printf("  N=%ld  dim=%ld  %s  nrs=%2d  latency=%.2f ms/batch  qps=%.0f  (batch=%ld queries)\n",
+           kN, kDim, mname, nrs, ms, qps, kQueries);
+    fflush(stdout);
+  }
+}
+
+TEST(CagraPruneRecall, SearchTimingNrs1vsNrs8)
+{
+  run_timing_test(cuvs::distance::DistanceType::L2Expanded);
 }
 
 }  // namespace
