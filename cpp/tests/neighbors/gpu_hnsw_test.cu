@@ -37,7 +37,7 @@ namespace {
 /**
  * Compute recall@k: fraction of true k-NN that appear in the result set.
  */
-float compute_recall(const std::vector<uint64_t>& gt_neighbors,
+float compute_recall(const std::vector<int64_t>& gt_neighbors,
                      const std::vector<uint64_t>& test_neighbors,
                      int n_queries,
                      int k)
@@ -45,7 +45,7 @@ float compute_recall(const std::vector<uint64_t>& gt_neighbors,
   int total_correct = 0;
   for (int q = 0; q < n_queries; q++) {
     for (int i = 0; i < k; i++) {
-      uint64_t test_id = test_neighbors[q * k + i];
+      int64_t test_id = static_cast<int64_t>(test_neighbors[q * k + i]);
       for (int j = 0; j < k; j++) {
         if (gt_neighbors[q * k + j] == test_id) {
           total_correct++;
@@ -108,7 +108,7 @@ TEST_P(GpuHnswSearchTest, RecallTest)
   hnsw_params.metric         = metric_;
   hnsw_params.M              = 32;
   hnsw_params.ef_construction = 200;
-  hnsw_params.hierarchy      = cuvs::neighbors::hnsw::HnswHierarchy::CPU;
+  hnsw_params.hierarchy      = cuvs::neighbors::hnsw::HnswHierarchy::NONE;
 
   auto hnsw_index = cuvs::neighbors::hnsw::build(
     res, hnsw_params, raft::make_const_mdspan(h_dataset.view()));
@@ -155,20 +155,21 @@ TEST_P(GpuHnswSearchTest, RecallTest)
   raft::copy(d_dataset.data_handle(), h_dataset.data_handle(),
              n_rows_ * dim_, raft::resource::get_cuda_stream(res));
 
-  auto d_gt_neighbors = raft::make_device_matrix<uint64_t, int64_t>(res, n_queries_, k_);
+  auto d_gt_neighbors = raft::make_device_matrix<int64_t, int64_t>(res, n_queries_, k_);
   auto d_gt_distances = raft::make_device_matrix<float, int64_t>(res, n_queries_, k_);
 
-  auto bf_params  = cuvs::neighbors::brute_force::index_params();
-  bf_params.metric = metric_;
-  auto bf_index   = cuvs::neighbors::brute_force::build(
-    res, bf_params, raft::make_const_mdspan(d_dataset.view()));
+  cuvs::neighbors::brute_force::index_params bf_index_params;
+  bf_index_params.metric = metric_;
+  auto bf_index = cuvs::neighbors::brute_force::build(
+    res, bf_index_params, raft::make_const_mdspan(d_dataset.view()));
+  cuvs::neighbors::brute_force::search_params bf_search_params;
   cuvs::neighbors::brute_force::search(
-    res, bf_index,
+    res, bf_search_params, bf_index,
     raft::make_const_mdspan(d_queries.view()),
     d_gt_neighbors.view(),
     d_gt_distances.view());
 
-  std::vector<uint64_t> h_gt_neighbors(n_queries_ * k_);
+  std::vector<int64_t> h_gt_neighbors(n_queries_ * k_);
   raft::copy(h_gt_neighbors.data(), d_gt_neighbors.data_handle(),
              n_queries_ * k_, raft::resource::get_cuda_stream(res));
   raft::resource::sync_stream(res);

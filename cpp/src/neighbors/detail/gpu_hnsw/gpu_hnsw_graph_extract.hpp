@@ -62,9 +62,7 @@ void extract_hnsw_layers(const hnswlib::HierarchicalNSW<DistT>& hnsw_alg,
     // node_ids is empty for layer 0 (implicit identity)
 
     for (size_t i = 0; i < N; i++) {
-      // In hnswlib, layer-0 links are at offset 0 of data_level0_memory_ entry
-      const char* data = hnsw_alg.getDataByInternalId(i);
-      // Actually, links are stored before the data. Let's use the hnswlib API properly.
+      // Links are stored before the data in data_level0_memory_. Use the hnswlib API directly.
       // data_level0_memory_ layout per element:
       //   [0..size_links_level0_) = link list for layer 0
       //   [size_links_level0_..size_data_per_element_) = data + label

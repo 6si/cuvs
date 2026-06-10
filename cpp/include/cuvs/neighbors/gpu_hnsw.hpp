@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cuvs/core/export.hpp>
 #include <cuvs/distance/distance.hpp>
 #include <cuvs/neighbors/hnsw.hpp>
 
@@ -16,7 +17,9 @@
 #include <memory>
 #include <vector>
 
-namespace cuvs::neighbors::gpu_hnsw {
+namespace CUVS_EXPORT cuvs {
+namespace neighbors {
+namespace gpu_hnsw {
 
 /**
  * @defgroup gpu_hnsw_cpp_index_params GPU HNSW search parameters
@@ -195,4 +198,6 @@ void search(raft::resources const& res,
  * @}
  */
 
-}  // namespace cuvs::neighbors::gpu_hnsw
+}  // namespace gpu_hnsw
+}  // namespace neighbors
+}  // namespace CUVS_EXPORT cuvs

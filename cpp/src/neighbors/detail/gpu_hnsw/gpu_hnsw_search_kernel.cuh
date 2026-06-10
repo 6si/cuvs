@@ -54,6 +54,33 @@ __device__ __forceinline__ float warp_ip_distance(const float* __restrict__ a,
   return -partial;
 }
 
+/**
+ * Single-thread distance computation (for use in block-parallel patterns
+ * where each thread handles one candidate).
+ */
+__device__ __forceinline__ float thread_l2_distance(const float* __restrict__ a,
+                                                    const float* __restrict__ b,
+                                                    int dim)
+{
+  float sum = 0.0f;
+  for (int d = 0; d < dim; d++) {
+    float diff = a[d] - b[d];
+    sum += diff * diff;
+  }
+  return sum;
+}
+
+__device__ __forceinline__ float thread_ip_distance(const float* __restrict__ a,
+                                                    const float* __restrict__ b,
+                                                    int dim)
+{
+  float sum = 0.0f;
+  for (int d = 0; d < dim; d++) {
+    sum += a[d] * b[d];
+  }
+  return -sum;
+}
+
 // ============================================================================
 // Phase 1: Upper-layer greedy search
 // ============================================================================
@@ -189,18 +216,14 @@ __device__ __forceinline__ bool hash_insert(uint32_t* hash_table,
     if (old == UINT32_MAX) return true;   // Newly inserted
     if (old == node_id) return false;     // Already present
   }
-  return false;  // Hash full — treat as visited to avoid duplicate work
+  return true;  // Hash full, accept as new to avoid infinite loop
 }
 
 /**
  * Phase 2: Layer-0 beam search with guided entry points.
  *
- * One thread block per query. Uses warp-cooperative distance computation
- * for coalesced memory access (each warp computes one distance in parallel).
- *
- * Shared memory holds:
+ * One thread block per query. Shared memory holds:
  *   - Result buffer: sorted (id, dist) pairs of the best `ef` candidates
- *   - is_expanded: per-slot flags tracking which result entries have been expanded
  *   - Staging buffer: newly computed (id, dist) candidates from current iteration
  *   - Hash table: visited node tracking
  *   - Parent buffer: nodes to expand in current iteration
@@ -208,7 +231,8 @@ __device__ __forceinline__ bool hash_insert(uint32_t* hash_table,
  *
  * Flow per iteration:
  *   1. Thread 0 selects top `search_width` unexpanded candidates as parents
- *   2. Warps cooperatively expand parents' neighbors (warp-parallel distance)
+ *   2. All threads expand parents' neighbors in parallel, compute distances,
+ *      write new candidates to staging buffer
  *   3. Thread 0 merges staging buffer into result buffer (sorted insert)
  *   4. Repeat until no new parents or max_iterations reached
  */
@@ -232,13 +256,10 @@ __global__ void layer0_beam_search_kernel(
   int query_idx = blockIdx.x;
   if (query_idx >= num_queries) return;
 
-  const int warp_id = threadIdx.x / 32;
-  const int lane    = threadIdx.x % 32;
-  const int num_warps = blockDim.x / 32;
-
   const float* query = d_queries + static_cast<int64_t>(query_idx) * dim;
 
   // --- Shared memory layout ---
+  // We allocate dynamically and partition manually.
   extern __shared__ char smem[];
 
   // Hash table size: next power of 2 >= 8*ef, minimum 512
@@ -246,27 +267,22 @@ __global__ void layer0_beam_search_kernel(
   while (hash_sz < static_cast<uint32_t>(8 * ef)) hash_sz <<= 1;
   uint32_t hash_mask = hash_sz - 1;
 
-  // Max staging buffer size (bounded by search_width * max_degree0 unique new nodes per iter)
+  // Max staging buffer size (number of new candidates per iteration)
   int max_staging = search_width * max_degree0;
 
   // Shared memory partitioning:
-  char* ptr = smem;
-  uint32_t* result_ids    = reinterpret_cast<uint32_t*>(ptr);  ptr += ef * sizeof(uint32_t);
-  float* result_dists     = reinterpret_cast<float*>(ptr);     ptr += ef * sizeof(float);
-  uint8_t* is_expanded    = reinterpret_cast<uint8_t*>(ptr);   ptr += ef * sizeof(uint8_t);
-  // Align to 4 bytes
-  ptr = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(ptr) + 3) & ~3ull);
-  uint32_t* staging_ids   = reinterpret_cast<uint32_t*>(ptr);  ptr += max_staging * sizeof(uint32_t);
-  float* staging_dists    = reinterpret_cast<float*>(ptr);     ptr += max_staging * sizeof(float);
-  uint32_t* hash_table    = reinterpret_cast<uint32_t*>(ptr);  ptr += hash_sz * sizeof(uint32_t);
-  uint32_t* parent_ids    = reinterpret_cast<uint32_t*>(ptr);  ptr += search_width * sizeof(uint32_t);
-  int* meta               = reinterpret_cast<int*>(ptr);       // [3]: result_count, staging_count, num_parents
+  uint32_t* result_ids    = reinterpret_cast<uint32_t*>(smem);                   // [ef]
+  float* result_dists     = reinterpret_cast<float*>(result_ids + ef);           // [ef]
+  uint32_t* staging_ids   = reinterpret_cast<uint32_t*>(result_dists + ef);      // [max_staging]
+  float* staging_dists    = reinterpret_cast<float*>(staging_ids + max_staging);  // [max_staging]
+  uint32_t* hash_table    = reinterpret_cast<uint32_t*>(staging_dists + max_staging);  // [hash_sz]
+  uint32_t* parent_ids    = hash_table + hash_sz;                                // [search_width]
+  int* meta               = reinterpret_cast<int*>(parent_ids + search_width);   // [3]: result_count, staging_count, num_parents
 
   // Initialize
   for (int i = threadIdx.x; i < ef; i += blockDim.x) {
-    result_ids[i]   = UINT32_MAX;
+    result_ids[i]  = UINT32_MAX;
     result_dists[i] = FLT_MAX;
-    is_expanded[i]  = 0;
   }
   for (uint32_t i = threadIdx.x; i < hash_sz; i += blockDim.x) {
     hash_table[i] = UINT32_MAX;
@@ -278,89 +294,73 @@ __global__ void layer0_beam_search_kernel(
   }
   __syncthreads();
 
-  // --- Seed with entry point (warp 0 computes distance cooperatively) ---
+  // --- Seed with entry point ---
   uint32_t ep = d_entry_points[query_idx];
-  float ep_dist;
-  if (warp_id == 0) {
+  if (threadIdx.x == 0) {
+    float ep_dist;
     if (use_inner_product) {
-      ep_dist = warp_ip_distance(query, d_dataset + static_cast<int64_t>(ep) * dim, dim);
+      ep_dist = thread_ip_distance(query, d_dataset + static_cast<int64_t>(ep) * dim, dim);
     } else {
-      ep_dist = warp_l2_distance(query, d_dataset + static_cast<int64_t>(ep) * dim, dim);
+      ep_dist = thread_l2_distance(query, d_dataset + static_cast<int64_t>(ep) * dim, dim);
     }
-    if (lane == 0) {
-      result_ids[0]   = ep;
-      result_dists[0] = ep_dist;
-      is_expanded[0]  = 1;  // Will expand immediately below
-      meta[0] = 1;
-      hash_insert(hash_table, hash_mask, ep);
-    }
+    result_ids[0]  = ep;
+    result_dists[0] = ep_dist;
+    meta[0] = 1;  // result_count = 1
+    hash_insert(hash_table, hash_mask, ep);
   }
   __syncthreads();
 
-  // --- Seed with entry point's neighbors (warp-cooperative distance) ---
-  if (threadIdx.x == 0) meta[1] = 0;
+  // --- Seed with entry point's neighbors ---
+  if (threadIdx.x == 0) meta[1] = 0;  // staging_count = 0
   __syncthreads();
 
-  // Each warp processes one neighbor at a time
-  for (int j = warp_id; j < max_degree0; j += num_warps) {
+  for (int j = threadIdx.x; j < max_degree0; j += blockDim.x) {
     uint32_t nbr = d_layer0_graph[static_cast<int64_t>(ep) * max_degree0 + j];
+    if (nbr == UINT32_MAX || nbr >= static_cast<uint32_t>(N)) continue;
+    if (!hash_insert(hash_table, hash_mask, nbr)) continue;
 
-    // Lane 0 does validity + hash check
-    bool is_new = false;
-    if (lane == 0) {
-      if (nbr != UINT32_MAX && nbr < static_cast<uint32_t>(N)) {
-        is_new = hash_insert(hash_table, hash_mask, nbr);
-      }
-    }
-    // Broadcast hash result and nbr to all lanes in warp
-    int is_new_int = is_new ? 1 : 0;
-    is_new_int = __shfl_sync(0xffffffff, is_new_int, 0);
-    nbr = __shfl_sync(0xffffffff, nbr, 0);
-    if (!is_new_int) continue;
-
-    // Warp-cooperative distance
     float dist;
     if (use_inner_product) {
-      dist = warp_ip_distance(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
+      dist = thread_ip_distance(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
     } else {
-      dist = warp_l2_distance(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
+      dist = thread_l2_distance(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
     }
 
-    // Lane 0 writes to staging
-    if (lane == 0) {
-      int slot = atomicAdd(&meta[1], 1);
-      if (slot < max_staging) {
-        staging_ids[slot]   = nbr;
-        staging_dists[slot] = dist;
-      }
+    int slot = atomicAdd(&meta[1], 1);
+    if (slot < max_staging) {
+      staging_ids[slot]  = nbr;
+      staging_dists[slot] = dist;
     }
   }
   __syncthreads();
 
-  // Merge staging into result buffer (thread 0, shifts is_expanded with data)
+  // Merge staging into result buffer (thread 0)
   if (threadIdx.x == 0) {
     int staging_count = min(meta[1], max_staging);
     int rc = meta[0];
     for (int s = 0; s < staging_count; s++) {
-      uint32_t sid = staging_ids[s];
-      float sdist  = staging_dists[s];
+      uint32_t sid  = staging_ids[s];
+      float sdist   = staging_dists[s];
+
+      // Skip if worse than worst in full buffer
       if (rc >= ef && sdist >= result_dists[rc - 1]) continue;
 
+      // Find insertion position (binary search)
       int lo = 0, hi = rc;
       while (lo < hi) {
         int mid = (lo + hi) / 2;
         if (result_dists[mid] < sdist) lo = mid + 1;
         else hi = mid;
       }
+
+      // Shift elements right
       int insert_end = rc < ef ? rc : ef - 1;
       for (int i = insert_end; i > lo; i--) {
-        result_ids[i]   = result_ids[i - 1];
+        result_ids[i]  = result_ids[i - 1];
         result_dists[i] = result_dists[i - 1];
-        is_expanded[i]  = is_expanded[i - 1];
       }
-      result_ids[lo]   = sid;
+      result_ids[lo]  = sid;
       result_dists[lo] = sdist;
-      is_expanded[lo]  = 0;  // New candidate, not yet expanded
       if (rc < ef) rc++;
     }
     meta[0] = rc;
@@ -368,63 +368,48 @@ __global__ void layer0_beam_search_kernel(
   __syncthreads();
 
   // --- Main beam search loop ---
+  int expanded = 1;  // We've already expanded the entry point
   for (int iter = 0; iter < max_iterations; iter++) {
     // Step 1: Thread 0 selects parents (next search_width unexpanded candidates)
     if (threadIdx.x == 0) {
       int num_parents = 0;
       int rc = meta[0];
-      for (int i = 0; i < rc && num_parents < search_width; i++) {
-        if (!is_expanded[i]) {
-          parent_ids[num_parents++] = result_ids[i];
-          is_expanded[i] = 1;
-        }
+      for (int i = expanded; i < rc && num_parents < search_width; i++) {
+        parent_ids[num_parents++] = result_ids[i];
       }
       meta[2] = num_parents;
+      expanded += num_parents;
     }
     __syncthreads();
 
     int num_parents = meta[2];
     if (num_parents == 0) break;  // Converged: no more candidates to expand
 
-    // Step 2: Warps cooperatively expand parents' neighbors
-    if (threadIdx.x == 0) meta[1] = 0;
+    // Step 2: Expand parents' neighbors in parallel
+    if (threadIdx.x == 0) meta[1] = 0;  // Reset staging_count
     __syncthreads();
 
     int total_work = num_parents * max_degree0;
-    for (int wi = warp_id; wi < total_work; wi += num_warps) {
+    for (int wi = threadIdx.x; wi < total_work; wi += blockDim.x) {
       int parent_idx = wi / max_degree0;
       int nbr_slot   = wi % max_degree0;
 
       uint32_t parent = parent_ids[parent_idx];
       uint32_t nbr = d_layer0_graph[static_cast<int64_t>(parent) * max_degree0 + nbr_slot];
+      if (nbr == UINT32_MAX || nbr >= static_cast<uint32_t>(N)) continue;
+      if (!hash_insert(hash_table, hash_mask, nbr)) continue;
 
-      // Lane 0 does validity + hash check
-      bool is_new = false;
-      if (lane == 0) {
-        if (nbr != UINT32_MAX && nbr < static_cast<uint32_t>(N)) {
-          is_new = hash_insert(hash_table, hash_mask, nbr);
-        }
-      }
-      int is_new_int = is_new ? 1 : 0;
-      is_new_int = __shfl_sync(0xffffffff, is_new_int, 0);
-      nbr = __shfl_sync(0xffffffff, nbr, 0);
-      if (!is_new_int) continue;
-
-      // Warp-cooperative distance computation (coalesced reads)
       float dist;
       if (use_inner_product) {
-        dist = warp_ip_distance(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
+        dist = thread_ip_distance(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
       } else {
-        dist = warp_l2_distance(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
+        dist = thread_l2_distance(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
       }
 
-      // Lane 0 writes to staging buffer
-      if (lane == 0) {
-        int slot = atomicAdd(&meta[1], 1);
-        if (slot < max_staging) {
-          staging_ids[slot]   = nbr;
-          staging_dists[slot] = dist;
-        }
+      int slot = atomicAdd(&meta[1], 1);
+      if (slot < max_staging) {
+        staging_ids[slot]  = nbr;
+        staging_dists[slot] = dist;
       }
     }
     __syncthreads();
@@ -446,13 +431,11 @@ __global__ void layer0_beam_search_kernel(
         }
         int insert_end = rc < ef ? rc : ef - 1;
         for (int i = insert_end; i > lo; i--) {
-          result_ids[i]   = result_ids[i - 1];
+          result_ids[i]  = result_ids[i - 1];
           result_dists[i] = result_dists[i - 1];
-          is_expanded[i]  = is_expanded[i - 1];
         }
-        result_ids[lo]   = sid;
+        result_ids[lo]  = sid;
         result_dists[lo] = sdist;
-        is_expanded[lo]  = 0;
         if (rc < ef) rc++;
       }
       meta[0] = rc;
@@ -485,8 +468,6 @@ inline size_t calc_layer0_smem_size(int ef, int search_width, int max_degree0)
   size_t size = 0;
   size += ef * sizeof(uint32_t);         // result_ids
   size += ef * sizeof(float);            // result_dists
-  size += ef * sizeof(uint8_t);          // is_expanded flags
-  size = (size + 3) & ~3ull;             // align to 4 bytes
   size += max_staging * sizeof(uint32_t); // staging_ids
   size += max_staging * sizeof(float);    // staging_dists
   size += hash_sz * sizeof(uint32_t);    // hash_table
