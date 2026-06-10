@@ -22,6 +22,11 @@
 
 #ifdef CUVS_BUILD_CAGRA_HNSWLIB
 
+// Suppress hnswlib sign-conversion warnings under nvcc (-Werror treats #68-D as error)
+#ifdef __NVCC__
+#pragma nv_diag_suppress 68
+#endif
+
 #include <gtest/gtest.h>
 
 #include <cuvs/neighbors/gpu_hnsw.hpp>
@@ -30,9 +35,12 @@
 
 // Internal detail header to access index_impl (needed to wrap raw hnswlib index)
 #include "../../src/neighbors/detail/hnsw.hpp"
-
 #include <hnswlib/hnswalg.h>
 #include <hnswlib/hnswlib.h>
+
+#ifdef __NVCC__
+#pragma nv_diag_default 68
+#endif
 
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/host_mdarray.hpp>
