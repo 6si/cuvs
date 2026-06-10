@@ -48,6 +48,7 @@
 #include <chrono>
 #include <cstdint>
 #include <random>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -355,11 +356,13 @@ TEST_P(GpuHnswScaleTest, ScaleRecallTest)
   }
 
   // --- Step 1: Build CPU HNSW ---
-  std::cout << "  Building CPU HNSW (M=32, ef_construction=200)...\n";
+  // ef_construction=50 (vs 200) for speed at large N. Recall is lower but
+  // sufficient to validate GPU search correctness vs CPU HNSW baseline.
+  std::cout << "  Building CPU HNSW (M=32, ef_construction=50, parallel)...\n";
   auto build_start = std::chrono::high_resolution_clock::now();
 
   int M_build = 32;
-  int ef_construction = 200;
+  int ef_construction = 50;
 
   auto hnsw_index = std::make_unique<cuvs::neighbors::hnsw::detail::index_impl<float>>(
     dim_, metric_, cuvs::neighbors::hnsw::HnswHierarchy::CPU);
@@ -367,11 +370,19 @@ TEST_P(GpuHnswScaleTest, ScaleRecallTest)
   auto hnsw_alg = std::make_unique<hnswlib::HierarchicalNSW<float>>(
     hnsw_index->get_space(), n_rows_, M_build, ef_construction);
 
-  for (int64_t i = 0; i < n_rows_; i++) {
+  // Parallel build using hnswlib's thread-safe addPoint (add first point
+  // sequentially to initialize, then parallelize remaining insertions).
+  hnsw_alg->addPoint(
+    static_cast<const void*>(h_dataset.data_handle()), static_cast<hnswlib::labeltype>(0));
+  int num_threads = std::min(static_cast<int>(std::thread::hardware_concurrency()), 32);
+  #pragma omp parallel for num_threads(num_threads) schedule(dynamic, 1024)
+  for (int64_t i = 1; i < n_rows_; i++) {
     hnsw_alg->addPoint(
-      static_cast<const void*>(h_dataset.data_handle() + i * dim_), i);
-    if (i > 0 && i % 500000 == 0) {
-      std::cout << "    inserted " << i << " / " << n_rows_ << "\n";
+      static_cast<const void*>(h_dataset.data_handle() + i * dim_),
+      static_cast<hnswlib::labeltype>(i));
+    if (i % 500000 == 0 && i > 0) {
+      #pragma omp critical
+      std::cout << "    inserted ~" << i << " / " << n_rows_ << "\n" << std::flush;
     }
   }
 
@@ -380,11 +391,24 @@ TEST_P(GpuHnswScaleTest, ScaleRecallTest)
   double build_s = std::chrono::duration<double>(build_end - build_start).count();
   std::cout << "  CPU HNSW build: " << build_s << " s\n";
 
+  // Parallel build assigns internal IDs in insertion order, which differs from label order.
+  // Reorder dataset so row[internal_id] = original_dataset[label_of_internal_id].
+  auto* cpu_hnsw = const_cast<hnswlib::HierarchicalNSW<float>*>(
+    static_cast<const hnswlib::HierarchicalNSW<float>*>(hnsw_index->get_index()));
+  auto h_dataset_for_gpu = raft::make_host_matrix<float, int64_t>(n_rows_, dim_);
+  for (int64_t id = 0; id < n_rows_; id++) {
+    auto label = static_cast<int64_t>(
+      cpu_hnsw->getExternalLabel(static_cast<hnswlib::tableint>(id)));
+    std::memcpy(h_dataset_for_gpu.data_handle() + id * dim_,
+                h_dataset.data_handle() + label * dim_,
+                dim_ * sizeof(float));
+  }
+
   // --- Step 2: Convert to GPU ---
   std::cout << "  Converting to GPU index...\n";
   auto convert_start = std::chrono::high_resolution_clock::now();
   auto gpu_idx = cuvs::neighbors::gpu_hnsw::from_hnsw_index<float>(
-    res, *hnsw_index, raft::make_const_mdspan(h_dataset.view()));
+    res, *hnsw_index, raft::make_const_mdspan(h_dataset_for_gpu.view()));
   auto convert_end = std::chrono::high_resolution_clock::now();
   double convert_s = std::chrono::duration<double>(convert_end - convert_start).count();
 
@@ -424,15 +448,19 @@ TEST_P(GpuHnswScaleTest, ScaleRecallTest)
   auto t1 = std::chrono::high_resolution_clock::now();
   double gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-  // Copy results
+  // Copy results and remap internal IDs → labels
   std::vector<uint64_t> h_gpu_neighbors(n_queries_ * k_);
   raft::copy(h_gpu_neighbors.data(), d_neighbors.data_handle(),
              n_queries_ * k_, raft::resource::get_cuda_stream(res));
   raft::resource::sync_stream(res);
+  for (int64_t i = 0; i < n_queries_ * k_; i++) {
+    if (h_gpu_neighbors[i] != UINT64_MAX) {
+      h_gpu_neighbors[i] = static_cast<uint64_t>(
+        cpu_hnsw->getExternalLabel(static_cast<hnswlib::tableint>(h_gpu_neighbors[i])));
+    }
+  }
 
   // --- Step 5: CPU HNSW search (ground truth at scale) ---
-  auto* cpu_hnsw = const_cast<hnswlib::HierarchicalNSW<float>*>(
-    static_cast<const hnswlib::HierarchicalNSW<float>*>(hnsw_index->get_index()));
   cpu_hnsw->setEf(search_params.ef);
 
   // Warmup
