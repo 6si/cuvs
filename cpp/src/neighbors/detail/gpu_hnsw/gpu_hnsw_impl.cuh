@@ -81,17 +81,25 @@ void search_impl(raft::resources const& res,
   }
 
   int block_size   = params.thread_block_size > 0 ? params.thread_block_size : 128;
-  size_t smem_size = calc_layer0_smem_size(ef, sw, idx.max_degree0(),
-                                           static_cast<int>(idx.n_rows()));
+  size_t smem_size = calc_layer0_smem_size(ef, sw, idx.max_degree0());
+
+  // Allocate global-memory visited bitmaps (one per query, pre-zeroed)
+  int N_int = static_cast<int>(idx.n_rows());
+  size_t bitmap_bytes = calc_visited_bitmap_size(num_queries, N_int);
+  uint32_t* d_visited_bitmaps = nullptr;
+  RAFT_CUDA_TRY(cudaMalloc(&d_visited_bitmaps, bitmap_bytes));
+  RAFT_CUDA_TRY(cudaMemsetAsync(d_visited_bitmaps, 0, bitmap_bytes, stream));
 
   layer0_beam_search_kernel<<<num_queries, block_size, smem_size, stream>>>(
     d_queries_f, d_dataset_f, idx.d_layer0_graph, d_entry_points,
+    d_visited_bitmaps,
     neighbors.data_handle(), distances.data_handle(),
-    num_queries, static_cast<int>(idx.n_rows()), dim, idx.max_degree0(),
+    num_queries, N_int, dim, idx.max_degree0(),
     k, ef, sw, max_iter, use_ip);
 
-  RAFT_CUDA_TRY(cudaFree(d_entry_points));
   RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+  RAFT_CUDA_TRY(cudaFree(d_entry_points));
+  RAFT_CUDA_TRY(cudaFree(d_visited_bitmaps));
 }
 
 }  // namespace cuvs::neighbors::gpu_hnsw::detail

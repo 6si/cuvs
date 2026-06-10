@@ -231,15 +231,12 @@ __device__ __forceinline__ bool bitmap_visit(uint32_t* bitmap,
  *   - Result buffer: sorted (id, dist) pairs of the best `ef` candidates
  *   - is_expanded: per-slot flags tracking expansion state per result slot
  *   - Staging buffer: newly computed (id, dist) candidates from current iteration
- *   - Visited bitmap: exact visited-node tracking for all N nodes
  *   - Parent buffer + metadata
  *
- * The visited bitmap (ceil(N/32) uint32s) replaces the hash table. This gives
- * exact visited tracking for all N nodes without hash collisions or false
- * "already visited" returns when the table is full.
- *
- * For N=50K: bitmap = 1563 uint32 = 6.25KB. Fine within 48KB smem.
- * For N=10K: bitmap = 313 uint32 = 1.25KB. Very compact.
+ * The visited bitmap lives in global memory (one bitmap per query block) to
+ * support large N (e.g. N=2M → 250KB bitmap, exceeds 48KB shared memory limit).
+ * At runtime, L2 cache (48MB+ on modern GPUs) keeps the active bitmap hot,
+ * so atomicOr on global memory is fast for typical access patterns.
  *
  * Correctness note on is_expanded[]:
  *   The result buffer is sorted ascending by distance. Insertions at position lo
@@ -252,6 +249,7 @@ __global__ void layer0_beam_search_kernel(
   const float* __restrict__ d_dataset,
   const uint32_t* __restrict__ d_layer0_graph,
   const uint32_t* __restrict__ d_entry_points,
+  uint32_t* __restrict__ d_visited_bitmaps,  // [num_queries x bitmap_words], pre-zeroed
   uint64_t* __restrict__ d_neighbors,
   float* __restrict__ d_distances,
   int num_queries,
@@ -276,25 +274,24 @@ __global__ void layer0_beam_search_kernel(
   int bitmap_words  = (N + 31) / 32;  // ceil(N/32)
 
   // Shared memory partitioning (all 4-byte aligned):
+  // Visited bitmap lives in global memory (too large for smem at N=2M+).
   uint32_t* result_ids    = reinterpret_cast<uint32_t*>(smem);
   float*    result_dists  = reinterpret_cast<float*>(result_ids + ef);
   uint32_t* is_expanded   = reinterpret_cast<uint32_t*>(result_dists + ef);
   uint32_t* staging_ids   = is_expanded + ef;
   float*    staging_dists = reinterpret_cast<float*>(staging_ids + max_staging);
-  uint32_t* visited_bmap  = reinterpret_cast<uint32_t*>(staging_dists + max_staging);
-  uint32_t* parent_ids    = visited_bmap + bitmap_words;
+  uint32_t* parent_ids    = reinterpret_cast<uint32_t*>(staging_dists + max_staging);
   int*      meta          = reinterpret_cast<int*>(parent_ids + search_width);
   // meta[0]=result_count, meta[1]=staging_count, meta[2]=num_parents
+
+  // Per-query visited bitmap in global memory (pre-zeroed by host)
+  uint32_t* visited_bmap = d_visited_bitmaps + static_cast<int64_t>(query_idx) * bitmap_words;
 
   // Initialize result buffer and expansion flags
   for (int i = threadIdx.x; i < ef; i += blockDim.x) {
     result_ids[i]   = UINT32_MAX;
     result_dists[i] = FLT_MAX;
     is_expanded[i]  = 0;
-  }
-  // Initialize visited bitmap to all zeros
-  for (int i = threadIdx.x; i < bitmap_words; i += blockDim.x) {
-    visited_bmap[i] = 0;
   }
   if (threadIdx.x == 0) {
     meta[0] = 0;
@@ -479,10 +476,13 @@ __global__ void layer0_beam_search_kernel(
  * Calculate shared memory size needed for layer0_beam_search_kernel.
  * N is the number of vectors; visited bitmap size scales with N.
  */
-inline size_t calc_layer0_smem_size(int ef, int search_width, int max_degree0, int N)
+/**
+ * Calculate shared memory size needed for layer0_beam_search_kernel.
+ * The visited bitmap is in global memory (not counted here).
+ */
+inline size_t calc_layer0_smem_size(int ef, int search_width, int max_degree0)
 {
   int max_staging  = search_width * max_degree0;
-  int bitmap_words = (N + 31) / 32;
 
   size_t size = 0;
   size += ef * sizeof(uint32_t);            // result_ids
@@ -490,10 +490,18 @@ inline size_t calc_layer0_smem_size(int ef, int search_width, int max_degree0, i
   size += ef * sizeof(uint32_t);            // is_expanded
   size += max_staging * sizeof(uint32_t);   // staging_ids
   size += max_staging * sizeof(float);      // staging_dists
-  size += bitmap_words * sizeof(uint32_t);  // visited bitmap
   size += search_width * sizeof(uint32_t);  // parent_ids
   size += 3 * sizeof(int);                  // meta
   return size;
+}
+
+/**
+ * Calculate global memory size needed for visited bitmaps (one per query).
+ */
+inline size_t calc_visited_bitmap_size(int num_queries, int N)
+{
+  int bitmap_words = (N + 31) / 32;
+  return static_cast<size_t>(num_queries) * bitmap_words * sizeof(uint32_t);
 }
 
 }  // namespace cuvs::neighbors::gpu_hnsw::detail
