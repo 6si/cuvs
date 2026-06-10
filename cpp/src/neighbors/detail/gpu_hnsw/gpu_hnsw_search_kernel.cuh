@@ -56,7 +56,7 @@ __device__ __forceinline__ float warp_ip_distance(const float* __restrict__ a,
 
 /**
  * Single-thread distance computation (for use in block-parallel patterns
- * where each thread handles one candidate).
+ * where each thread handles one candidate independently).
  */
 __device__ __forceinline__ float thread_l2_distance(const float* __restrict__ a,
                                                     const float* __restrict__ b,
@@ -112,6 +112,10 @@ __device__ __forceinline__ uint32_t binary_search_node(const uint32_t* d_node_id
 /**
  * Phase 1: one warp per query, greedy walk from top layer down to layer 1.
  * Outputs the entry point for layer-0 beam search.
+ *
+ * Each lane independently computes per-neighbor distances using thread_*_distance
+ * (no warp shuffle needed in the inner loop), then the warp reduces to find the
+ * global best.
  */
 __global__ void upper_layer_search_kernel(
   const float* __restrict__ d_queries,
@@ -132,12 +136,14 @@ __global__ void upper_layer_search_kernel(
   uint32_t current   = global_entry_point;
 
   float best_dist;
-  if (use_inner_product) {
-    best_dist = warp_ip_distance(query, d_dataset + static_cast<int64_t>(current) * dim, dim);
-  } else {
-    best_dist = warp_l2_distance(query, d_dataset + static_cast<int64_t>(current) * dim, dim);
+  if (lane == 0) {
+    if (use_inner_product) {
+      best_dist = thread_ip_distance(query, d_dataset + static_cast<int64_t>(current) * dim, dim);
+    } else {
+      best_dist = thread_l2_distance(query, d_dataset + static_cast<int64_t>(current) * dim, dim);
+    }
   }
-  best_dist = __shfl_sync(0xffffffff, best_dist, 0);  // broadcast to all lanes
+  best_dist = __shfl_sync(0xffffffff, best_dist, 0);
 
   // Traverse from top layer down to layer 1
   for (int li = num_upper_layers - 1; li >= 0; li--) {
@@ -148,23 +154,25 @@ __global__ void upper_layer_search_kernel(
       uint32_t local_idx = binary_search_node(lp.d_node_ids, lp.num_nodes, current);
       if (local_idx == UINT32_MAX) break;
 
-      // Each lane checks a different neighbor
-      uint32_t best_nbr  = UINT32_MAX;
+      // Each lane independently checks a different neighbor.
+      // We use thread_*_distance per lane + warp reduction for the minimum.
+      // warp_*_distance cannot be used here because all 32 lanes must cooperate
+      // on the SAME vector pair, but the outer loop assigns different neighbors
+      // to different lanes.
+      uint32_t best_nbr   = UINT32_MAX;
       float best_nbr_dist = best_dist;
 
       for (uint32_t j = lane; j < lp.max_degree; j += 32) {
         uint32_t nbr = lp.d_neighbors[static_cast<int64_t>(local_idx) * lp.max_degree + j];
-        if (nbr == UINT32_MAX) continue;
-
-        float dist;
-        if (use_inner_product) {
-          dist = warp_ip_distance(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
-        } else {
-          dist = warp_l2_distance(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
+        float dist = FLT_MAX;
+        if (nbr != UINT32_MAX) {
+          const float* nbr_vec = d_dataset + static_cast<int64_t>(nbr) * dim;
+          if (use_inner_product) {
+            dist = thread_ip_distance(query, nbr_vec, dim);
+          } else {
+            dist = thread_l2_distance(query, nbr_vec, dim);
+          }
         }
-        // Only lane 0 has the correct reduced distance
-        dist = __shfl_sync(0xffffffff, dist, 0);
-
         if (dist < best_nbr_dist) {
           best_nbr_dist = dist;
           best_nbr      = nbr;
@@ -180,7 +188,6 @@ __global__ void upper_layer_search_kernel(
           best_nbr      = other_id;
         }
       }
-      // Broadcast result to all lanes
       best_nbr_dist = __shfl_sync(0xffffffff, best_nbr_dist, 0);
       best_nbr      = __shfl_sync(0xffffffff, best_nbr, 0);
 
@@ -202,21 +209,19 @@ __global__ void upper_layer_search_kernel(
 // ============================================================================
 
 /**
- * Hash table insert with linear probing.
- * Returns true if the node was newly inserted, false if already present.
+ * Visited-set using a bitmap in shared memory.
+ * For node_id in [0, N), atomically sets bit node_id and returns true if it was
+ * newly set (i.e., node not previously visited), false if already visited.
+ *
+ * Requires bitmap[] to be zero-initialized before use.
  */
-__device__ __forceinline__ bool hash_insert(uint32_t* hash_table,
-                                            uint32_t hash_mask,
-                                            uint32_t node_id)
+__device__ __forceinline__ bool bitmap_visit(uint32_t* bitmap,
+                                             uint32_t node_id)
 {
-  uint32_t slot = (node_id * 2654435761u) & hash_mask;  // Knuth multiplicative hash
-  for (uint32_t i = 0; i < 64; i++) {
-    uint32_t probe = (slot + i) & hash_mask;
-    uint32_t old   = atomicCAS(&hash_table[probe], UINT32_MAX, node_id);
-    if (old == UINT32_MAX) return true;   // Newly inserted
-    if (old == node_id) return false;     // Already present
-  }
-  return true;  // Hash full, accept as new to avoid infinite loop
+  uint32_t word = node_id >> 5;         // node_id / 32
+  uint32_t bit  = 1u << (node_id & 31); // node_id % 32
+  uint32_t old  = atomicOr(&bitmap[word], bit);
+  return (old & bit) == 0;  // true if bit was newly set
 }
 
 /**
@@ -224,17 +229,23 @@ __device__ __forceinline__ bool hash_insert(uint32_t* hash_table,
  *
  * One thread block per query. Shared memory holds:
  *   - Result buffer: sorted (id, dist) pairs of the best `ef` candidates
+ *   - is_expanded: per-slot flags tracking expansion state per result slot
  *   - Staging buffer: newly computed (id, dist) candidates from current iteration
- *   - Hash table: visited node tracking
- *   - Parent buffer: nodes to expand in current iteration
- *   - Metadata: counters
+ *   - Visited bitmap: exact visited-node tracking for all N nodes
+ *   - Parent buffer + metadata
  *
- * Flow per iteration:
- *   1. Thread 0 selects top `search_width` unexpanded candidates as parents
- *   2. All threads expand parents' neighbors in parallel, compute distances,
- *      write new candidates to staging buffer
- *   3. Thread 0 merges staging buffer into result buffer (sorted insert)
- *   4. Repeat until no new parents or max_iterations reached
+ * The visited bitmap (ceil(N/32) uint32s) replaces the hash table. This gives
+ * exact visited tracking for all N nodes without hash collisions or false
+ * "already visited" returns when the table is full.
+ *
+ * For N=50K: bitmap = 1563 uint32 = 6.25KB. Fine within 48KB smem.
+ * For N=10K: bitmap = 313 uint32 = 1.25KB. Very compact.
+ *
+ * Correctness note on is_expanded[]:
+ *   The result buffer is sorted ascending by distance. Insertions at position lo
+ *   shift existing entries right. Per-slot is_expanded[] flags are shifted
+ *   together with (id, dist), keeping expansion state correct regardless of
+ *   insertion position.
  */
 __global__ void layer0_beam_search_kernel(
   const float* __restrict__ d_queries,
@@ -259,38 +270,36 @@ __global__ void layer0_beam_search_kernel(
   const float* query = d_queries + static_cast<int64_t>(query_idx) * dim;
 
   // --- Shared memory layout ---
-  // We allocate dynamically and partition manually.
   extern __shared__ char smem[];
 
-  // Hash table size: next power of 2 >= 8*ef, minimum 512
-  uint32_t hash_sz = 512;
-  while (hash_sz < static_cast<uint32_t>(8 * ef)) hash_sz <<= 1;
-  uint32_t hash_mask = hash_sz - 1;
+  int max_staging   = search_width * max_degree0;
+  int bitmap_words  = (N + 31) / 32;  // ceil(N/32)
 
-  // Max staging buffer size (number of new candidates per iteration)
-  int max_staging = search_width * max_degree0;
+  // Shared memory partitioning (all 4-byte aligned):
+  uint32_t* result_ids    = reinterpret_cast<uint32_t*>(smem);
+  float*    result_dists  = reinterpret_cast<float*>(result_ids + ef);
+  uint32_t* is_expanded   = reinterpret_cast<uint32_t*>(result_dists + ef);
+  uint32_t* staging_ids   = is_expanded + ef;
+  float*    staging_dists = reinterpret_cast<float*>(staging_ids + max_staging);
+  uint32_t* visited_bmap  = reinterpret_cast<uint32_t*>(staging_dists + max_staging);
+  uint32_t* parent_ids    = visited_bmap + bitmap_words;
+  int*      meta          = reinterpret_cast<int*>(parent_ids + search_width);
+  // meta[0]=result_count, meta[1]=staging_count, meta[2]=num_parents
 
-  // Shared memory partitioning:
-  uint32_t* result_ids    = reinterpret_cast<uint32_t*>(smem);                   // [ef]
-  float* result_dists     = reinterpret_cast<float*>(result_ids + ef);           // [ef]
-  uint32_t* staging_ids   = reinterpret_cast<uint32_t*>(result_dists + ef);      // [max_staging]
-  float* staging_dists    = reinterpret_cast<float*>(staging_ids + max_staging);  // [max_staging]
-  uint32_t* hash_table    = reinterpret_cast<uint32_t*>(staging_dists + max_staging);  // [hash_sz]
-  uint32_t* parent_ids    = hash_table + hash_sz;                                // [search_width]
-  int* meta               = reinterpret_cast<int*>(parent_ids + search_width);   // [3]: result_count, staging_count, num_parents
-
-  // Initialize
+  // Initialize result buffer and expansion flags
   for (int i = threadIdx.x; i < ef; i += blockDim.x) {
-    result_ids[i]  = UINT32_MAX;
+    result_ids[i]   = UINT32_MAX;
     result_dists[i] = FLT_MAX;
+    is_expanded[i]  = 0;
   }
-  for (uint32_t i = threadIdx.x; i < hash_sz; i += blockDim.x) {
-    hash_table[i] = UINT32_MAX;
+  // Initialize visited bitmap to all zeros
+  for (int i = threadIdx.x; i < bitmap_words; i += blockDim.x) {
+    visited_bmap[i] = 0;
   }
   if (threadIdx.x == 0) {
-    meta[0] = 0;  // result_count
-    meta[1] = 0;  // staging_count
-    meta[2] = 0;  // num_parents
+    meta[0] = 0;
+    meta[1] = 0;
+    meta[2] = 0;
   }
   __syncthreads();
 
@@ -303,21 +312,22 @@ __global__ void layer0_beam_search_kernel(
     } else {
       ep_dist = thread_l2_distance(query, d_dataset + static_cast<int64_t>(ep) * dim, dim);
     }
-    result_ids[0]  = ep;
+    result_ids[0]   = ep;
     result_dists[0] = ep_dist;
-    meta[0] = 1;  // result_count = 1
-    hash_insert(hash_table, hash_mask, ep);
+    is_expanded[0]  = 0;
+    meta[0] = 1;
+    bitmap_visit(visited_bmap, ep);
   }
   __syncthreads();
 
   // --- Seed with entry point's neighbors ---
-  if (threadIdx.x == 0) meta[1] = 0;  // staging_count = 0
+  if (threadIdx.x == 0) meta[1] = 0;
   __syncthreads();
 
   for (int j = threadIdx.x; j < max_degree0; j += blockDim.x) {
     uint32_t nbr = d_layer0_graph[static_cast<int64_t>(ep) * max_degree0 + j];
     if (nbr == UINT32_MAX || nbr >= static_cast<uint32_t>(N)) continue;
-    if (!hash_insert(hash_table, hash_mask, nbr)) continue;
+    if (!bitmap_visit(visited_bmap, nbr)) continue;
 
     float dist;
     if (use_inner_product) {
@@ -328,24 +338,21 @@ __global__ void layer0_beam_search_kernel(
 
     int slot = atomicAdd(&meta[1], 1);
     if (slot < max_staging) {
-      staging_ids[slot]  = nbr;
+      staging_ids[slot]   = nbr;
       staging_dists[slot] = dist;
     }
   }
   __syncthreads();
 
-  // Merge staging into result buffer (thread 0)
+  // Thread 0 merges ep's neighbors into result buffer, then marks ep expanded
   if (threadIdx.x == 0) {
     int staging_count = min(meta[1], max_staging);
     int rc = meta[0];
     for (int s = 0; s < staging_count; s++) {
       uint32_t sid  = staging_ids[s];
       float sdist   = staging_dists[s];
-
-      // Skip if worse than worst in full buffer
       if (rc >= ef && sdist >= result_dists[rc - 1]) continue;
 
-      // Find insertion position (binary search)
       int lo = 0, hi = rc;
       while (lo < hi) {
         int mid = (lo + hi) / 2;
@@ -353,40 +360,50 @@ __global__ void layer0_beam_search_kernel(
         else hi = mid;
       }
 
-      // Shift elements right
       int insert_end = rc < ef ? rc : ef - 1;
       for (int i = insert_end; i > lo; i--) {
-        result_ids[i]  = result_ids[i - 1];
+        result_ids[i]   = result_ids[i - 1];
         result_dists[i] = result_dists[i - 1];
+        is_expanded[i]  = is_expanded[i - 1];
       }
-      result_ids[lo]  = sid;
+      result_ids[lo]   = sid;
       result_dists[lo] = sdist;
+      is_expanded[lo]  = 0;
       if (rc < ef) rc++;
+    }
+
+    // Mark ep expanded (it may have shifted in the result buffer)
+    for (int i = 0; i < rc; i++) {
+      if (result_ids[i] == ep) {
+        is_expanded[i] = 1;
+        break;
+      }
     }
     meta[0] = rc;
   }
   __syncthreads();
 
   // --- Main beam search loop ---
-  int expanded = 1;  // We've already expanded the entry point
   for (int iter = 0; iter < max_iterations; iter++) {
-    // Step 1: Thread 0 selects parents (next search_width unexpanded candidates)
+    // Step 1: Thread 0 selects next search_width unexpanded candidates as parents
     if (threadIdx.x == 0) {
       int num_parents = 0;
       int rc = meta[0];
-      for (int i = expanded; i < rc && num_parents < search_width; i++) {
-        parent_ids[num_parents++] = result_ids[i];
+      for (int i = 0; i < rc && num_parents < search_width; i++) {
+        if (!is_expanded[i]) {
+          parent_ids[num_parents++] = result_ids[i];
+          is_expanded[i] = 1;
+        }
       }
       meta[2] = num_parents;
-      expanded += num_parents;
     }
     __syncthreads();
 
     int num_parents = meta[2];
-    if (num_parents == 0) break;  // Converged: no more candidates to expand
+    if (num_parents == 0) break;
 
     // Step 2: Expand parents' neighbors in parallel
-    if (threadIdx.x == 0) meta[1] = 0;  // Reset staging_count
+    if (threadIdx.x == 0) meta[1] = 0;
     __syncthreads();
 
     int total_work = num_parents * max_degree0;
@@ -397,7 +414,7 @@ __global__ void layer0_beam_search_kernel(
       uint32_t parent = parent_ids[parent_idx];
       uint32_t nbr = d_layer0_graph[static_cast<int64_t>(parent) * max_degree0 + nbr_slot];
       if (nbr == UINT32_MAX || nbr >= static_cast<uint32_t>(N)) continue;
-      if (!hash_insert(hash_table, hash_mask, nbr)) continue;
+      if (!bitmap_visit(visited_bmap, nbr)) continue;
 
       float dist;
       if (use_inner_product) {
@@ -408,7 +425,7 @@ __global__ void layer0_beam_search_kernel(
 
       int slot = atomicAdd(&meta[1], 1);
       if (slot < max_staging) {
-        staging_ids[slot]  = nbr;
+        staging_ids[slot]   = nbr;
         staging_dists[slot] = dist;
       }
     }
@@ -431,11 +448,13 @@ __global__ void layer0_beam_search_kernel(
         }
         int insert_end = rc < ef ? rc : ef - 1;
         for (int i = insert_end; i > lo; i--) {
-          result_ids[i]  = result_ids[i - 1];
+          result_ids[i]   = result_ids[i - 1];
           result_dists[i] = result_dists[i - 1];
+          is_expanded[i]  = is_expanded[i - 1];
         }
-        result_ids[lo]  = sid;
+        result_ids[lo]   = sid;
         result_dists[lo] = sdist;
+        is_expanded[lo]  = 0;
         if (rc < ef) rc++;
       }
       meta[0] = rc;
@@ -458,21 +477,22 @@ __global__ void layer0_beam_search_kernel(
 
 /**
  * Calculate shared memory size needed for layer0_beam_search_kernel.
+ * N is the number of vectors; visited bitmap size scales with N.
  */
-inline size_t calc_layer0_smem_size(int ef, int search_width, int max_degree0)
+inline size_t calc_layer0_smem_size(int ef, int search_width, int max_degree0, int N)
 {
-  uint32_t hash_sz = 512;
-  while (hash_sz < static_cast<uint32_t>(8 * ef)) hash_sz <<= 1;
-  int max_staging = search_width * max_degree0;
+  int max_staging  = search_width * max_degree0;
+  int bitmap_words = (N + 31) / 32;
 
   size_t size = 0;
-  size += ef * sizeof(uint32_t);         // result_ids
-  size += ef * sizeof(float);            // result_dists
-  size += max_staging * sizeof(uint32_t); // staging_ids
-  size += max_staging * sizeof(float);    // staging_dists
-  size += hash_sz * sizeof(uint32_t);    // hash_table
-  size += search_width * sizeof(uint32_t); // parent_ids
-  size += 3 * sizeof(int);              // meta
+  size += ef * sizeof(uint32_t);            // result_ids
+  size += ef * sizeof(float);               // result_dists
+  size += ef * sizeof(uint32_t);            // is_expanded
+  size += max_staging * sizeof(uint32_t);   // staging_ids
+  size += max_staging * sizeof(float);      // staging_dists
+  size += bitmap_words * sizeof(uint32_t);  // visited bitmap
+  size += search_width * sizeof(uint32_t);  // parent_ids
+  size += 3 * sizeof(int);                  // meta
   return size;
 }
 

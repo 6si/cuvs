@@ -12,12 +12,11 @@
  *   2. Wraps it in a cuvs::neighbors::hnsw::index via index_impl
  *   3. Converts it to GPU HNSW index using cuvs::neighbors::gpu_hnsw::from_hnsw_index
  *   4. Runs GPU HNSW search
- *   5. Compares recall against brute-force ground truth
+ *   5. Compares recall against CPU brute-force ground truth
+ *   6. Benchmarks GPU throughput vs CPU HNSW throughput
  *
- * We build hnswlib directly instead of going through hnsw::build() because
- * hnsw::build() routes through CAGRA → from_cagra, and the HnswHierarchy::CPU
- * path in from_cagra hangs. Direct hnswlib build is also what Milvus/Knowhere
- * does in production, so this better mirrors the real integration.
+ * Uses CPU brute-force for ground truth (not cuvs brute_force) to avoid
+ * triggering CAGRA JIT compilation which takes 20-30 minutes on first run.
  */
 
 #ifdef CUVS_BUILD_CAGRA_HNSWLIB
@@ -31,7 +30,6 @@
 
 #include <cuvs/neighbors/gpu_hnsw.hpp>
 #include <cuvs/neighbors/hnsw.hpp>
-#include <cuvs/neighbors/brute_force.hpp>
 
 // Internal detail header to access index_impl (needed to wrap raw hnswlib index)
 #include "../../src/neighbors/detail/hnsw.hpp"
@@ -45,14 +43,54 @@
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/host_mdarray.hpp>
 #include <raft/core/resources.hpp>
-#include <raft/random/rng.cuh>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <random>
 #include <vector>
 
 namespace {
+
+/**
+ * CPU brute-force kNN: computes exact top-k for each query.
+ * Avoids cuvs::brute_force which triggers heavy CUDA JIT compilation.
+ */
+void cpu_brute_force(const float* dataset,
+                     const float* queries,
+                     int64_t n_rows,
+                     int64_t n_queries,
+                     int64_t dim,
+                     int k,
+                     std::vector<int64_t>& neighbors,  // [n_queries * k]
+                     bool use_ip = false)
+{
+  neighbors.resize(n_queries * k);
+  std::vector<std::pair<float, int64_t>> dists(n_rows);
+
+  for (int64_t q = 0; q < n_queries; q++) {
+    const float* qvec = queries + q * dim;
+    for (int64_t i = 0; i < n_rows; i++) {
+      const float* dvec = dataset + i * dim;
+      float dist = 0.0f;
+      if (use_ip) {
+        float ip = 0.0f;
+        for (int64_t d = 0; d < dim; d++) ip += qvec[d] * dvec[d];
+        dist = -ip;
+      } else {
+        for (int64_t d = 0; d < dim; d++) {
+          float diff = qvec[d] - dvec[d];
+          dist += diff * diff;
+        }
+      }
+      dists[i] = {dist, i};
+    }
+    std::partial_sort(dists.begin(), dists.begin() + k, dists.end());
+    for (int j = 0; j < k; j++) {
+      neighbors[q * k + j] = dists[j].second;
+    }
+  }
+}
 
 /**
  * Compute recall@k: fraction of true k-NN that appear in the result set.
@@ -102,6 +140,7 @@ class GpuHnswSearchTest : public ::testing::TestWithParam<
 TEST_P(GpuHnswSearchTest, RecallTest)
 {
   raft::resources res;
+  bool use_ip = (metric_ == cuvs::distance::DistanceType::InnerProduct);
 
   // Generate random dataset
   auto h_dataset = raft::make_host_matrix<float, int64_t>(n_rows_, dim_);
@@ -124,20 +163,17 @@ TEST_P(GpuHnswSearchTest, RecallTest)
   }
 
   // --- Step 1: Build CPU HNSW index directly via hnswlib (full hierarchy) ---
-  // We build hnswlib directly instead of hnsw::build() to avoid the CAGRA→from_cagra
-  // pipeline (which hangs with HnswHierarchy::CPU). This also matches the Milvus
-  // production flow where hnswlib builds the index natively.
-  constexpr int M = 32;
-  constexpr int ef_construction = 200;
+  // Use M=32 for small N, M=64 for large N to ensure 95%+ recall is achievable.
+  // Milvus uses M=16 by default, but M=32 is more typical for high recall.
+  int M_build = (n_rows_ <= 10000) ? 32 : 64;
+  int ef_construction = 200;
 
   auto hnsw_index = std::make_unique<cuvs::neighbors::hnsw::detail::index_impl<float>>(
     dim_, metric_, cuvs::neighbors::hnsw::HnswHierarchy::CPU);
 
   auto hnsw_alg = std::make_unique<hnswlib::HierarchicalNSW<float>>(
-    hnsw_index->get_space(), n_rows_, M, ef_construction);
+    hnsw_index->get_space(), n_rows_, M_build, ef_construction);
 
-  // Insert all vectors (sequential — hnswlib addPoint is not fully thread-safe
-  // for concurrent inserts at small N, and we're testing correctness not build speed)
   for (int64_t i = 0; i < n_rows_; i++) {
     hnsw_alg->addPoint(
       static_cast<const void*>(h_dataset.data_handle() + i * dim_), i);
@@ -154,64 +190,100 @@ TEST_P(GpuHnswSearchTest, RecallTest)
   EXPECT_EQ(gpu_idx->dim(), dim_);
   EXPECT_GT(gpu_idx->num_layers(), 0);
 
+  std::cout << "  num_layers=" << gpu_idx->num_layers()
+            << " max_degree0=" << gpu_idx->max_degree0()
+            << " entry_point=" << gpu_idx->entry_point() << "\n";
+
   // --- Step 3: Upload queries to device ---
   auto d_queries = raft::make_device_matrix<float, int64_t>(res, n_queries_, dim_);
   raft::copy(d_queries.data_handle(), h_queries.data_handle(),
              n_queries_ * dim_, raft::resource::get_cuda_stream(res));
 
-  // --- Step 4: GPU HNSW search ---
+  // --- Step 4: GPU HNSW search (with warmup) ---
   auto d_neighbors = raft::make_device_matrix<uint64_t, int64_t>(res, n_queries_, k_);
   auto d_distances = raft::make_device_matrix<float, int64_t>(res, n_queries_, k_);
 
+  // ef scales with N and graph quality: larger datasets need higher ef for 95%+ recall
+  int ef_search = (n_rows_ <= 10000) ? 200 : 400;
   cuvs::neighbors::gpu_hnsw::search_params search_params;
-  search_params.ef = 200;
-  search_params.search_width = 4;
+  search_params.ef = ef_search;
+  search_params.search_width = (n_rows_ <= 10000) ? 4 : 8;
 
+  // Warmup
   cuvs::neighbors::gpu_hnsw::search<float>(
     res, search_params, *gpu_idx,
     raft::make_const_mdspan(d_queries.view()),
     d_neighbors.view(),
     d_distances.view());
 
+  // Timed run
+  auto t0 = std::chrono::high_resolution_clock::now();
+  cuvs::neighbors::gpu_hnsw::search<float>(
+    res, search_params, *gpu_idx,
+    raft::make_const_mdspan(d_queries.view()),
+    d_neighbors.view(),
+    d_distances.view());
+  auto t1 = std::chrono::high_resolution_clock::now();
+  double gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
   // --- Step 5: Copy results to host ---
   std::vector<uint64_t> h_gpu_neighbors(n_queries_ * k_);
-  std::vector<float> h_gpu_distances(n_queries_ * k_);
   raft::copy(h_gpu_neighbors.data(), d_neighbors.data_handle(),
              n_queries_ * k_, raft::resource::get_cuda_stream(res));
-  raft::copy(h_gpu_distances.data(), d_distances.data_handle(),
-             n_queries_ * k_, raft::resource::get_cuda_stream(res));
   raft::resource::sync_stream(res);
 
-  // --- Step 6: Compute ground truth with brute force ---
-  auto d_dataset = raft::make_device_matrix<float, int64_t>(res, n_rows_, dim_);
-  raft::copy(d_dataset.data_handle(), h_dataset.data_handle(),
-             n_rows_ * dim_, raft::resource::get_cuda_stream(res));
+  // --- Step 6: CPU brute-force ground truth ---
+  std::vector<int64_t> h_gt_neighbors;
+  cpu_brute_force(h_dataset.data_handle(), h_queries.data_handle(),
+                  n_rows_, n_queries_, dim_, k_, h_gt_neighbors, use_ip);
 
-  auto d_gt_neighbors = raft::make_device_matrix<int64_t, int64_t>(res, n_queries_, k_);
-  auto d_gt_distances = raft::make_device_matrix<float, int64_t>(res, n_queries_, k_);
+  // --- Step 7: CPU HNSW search latency (baseline) ---
+  auto* cpu_hnsw = const_cast<hnswlib::HierarchicalNSW<float>*>(
+    static_cast<const hnswlib::HierarchicalNSW<float>*>(hnsw_index->get_index()));
+  cpu_hnsw->setEf(ef_search);
 
-  cuvs::neighbors::brute_force::index_params bf_index_params;
-  bf_index_params.metric = metric_;
-  auto bf_index = cuvs::neighbors::brute_force::build(
-    res, bf_index_params, raft::make_const_mdspan(d_dataset.view()));
-  cuvs::neighbors::brute_force::search_params bf_search_params;
-  cuvs::neighbors::brute_force::search(
-    res, bf_search_params, bf_index,
-    raft::make_const_mdspan(d_queries.view()),
-    d_gt_neighbors.view(),
-    d_gt_distances.view());
+  // Warmup
+  cpu_hnsw->searchKnn(h_queries.data_handle(), k_);
 
-  std::vector<int64_t> h_gt_neighbors(n_queries_ * k_);
-  raft::copy(h_gt_neighbors.data(), d_gt_neighbors.data_handle(),
-             n_queries_ * k_, raft::resource::get_cuda_stream(res));
-  raft::resource::sync_stream(res);
+  auto t2 = std::chrono::high_resolution_clock::now();
+  for (int q = 0; q < n_queries_; q++) {
+    cpu_hnsw->searchKnn(h_queries.data_handle() + static_cast<int64_t>(q) * dim_, k_);
+  }
+  auto t3 = std::chrono::high_resolution_clock::now();
+  double cpu_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
 
-  // --- Step 7: Check recall ---
-  float recall = compute_recall(h_gt_neighbors, h_gpu_neighbors, n_queries_, k_);
+  // --- Step 8: Measure CPU HNSW recall ---
+  std::vector<int64_t> h_cpu_neighbors(n_queries_ * k_);
+  for (int q = 0; q < n_queries_; q++) {
+    auto result = cpu_hnsw->searchKnn(
+      h_queries.data_handle() + static_cast<int64_t>(q) * dim_, k_);
+    // searchKnn returns max-heap (worst first), collect all
+    int pos = k_ - 1;
+    while (!result.empty()) {
+      h_cpu_neighbors[q * k_ + pos] = static_cast<int64_t>(result.top().second);
+      result.pop();
+      pos--;
+    }
+  }
 
-  // At small scale (50K vectors), GPU HNSW should achieve >90% recall with ef=200
-  EXPECT_GT(recall, 0.90f)
-    << "Recall@" << k_ << " = " << recall << " (expected > 0.90)"
+  // --- Step 9: Report and check recall ---
+  float recall     = compute_recall(h_gt_neighbors, h_gpu_neighbors, n_queries_, k_);
+  std::vector<uint64_t> h_cpu_nbrs_u64(n_queries_ * k_);
+  for (int i = 0; i < n_queries_ * k_; i++) h_cpu_nbrs_u64[i] = static_cast<uint64_t>(h_cpu_neighbors[i]);
+  float cpu_recall = compute_recall(h_gt_neighbors, h_cpu_nbrs_u64, n_queries_, k_);
+
+  std::cout << "  N=" << n_rows_ << " dim=" << dim_ << " k=" << k_
+            << " metric=" << (use_ip ? "IP" : "L2") << "\n";
+  std::cout << "  GPU Recall@" << k_ << " = " << recall << "\n";
+  std::cout << "  CPU HNSW Recall@" << k_ << " = " << cpu_recall << " (ef=" << ef_search << ")\n";
+  std::cout << "  GPU: " << gpu_ms << " ms for " << n_queries_ << " queries"
+            << " (" << (n_queries_ / (gpu_ms / 1000.0)) << " QPS)\n";
+  std::cout << "  CPU HNSW: " << cpu_ms << " ms for " << n_queries_ << " queries"
+            << " (" << (n_queries_ / (cpu_ms / 1000.0)) << " QPS)\n";
+  std::cout << "  Speedup: " << (cpu_ms / gpu_ms) << "x\n";
+
+  EXPECT_GT(recall, 0.95f)
+    << "Recall@" << k_ << " = " << recall << " (expected > 0.95)"
     << " with n_rows=" << n_rows_ << " dim=" << dim_;
 }
 

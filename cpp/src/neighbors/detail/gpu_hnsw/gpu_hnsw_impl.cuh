@@ -81,7 +81,8 @@ void search_impl(raft::resources const& res,
   }
 
   int block_size   = params.thread_block_size > 0 ? params.thread_block_size : 128;
-  size_t smem_size = calc_layer0_smem_size(ef, sw, idx.max_degree0());
+  size_t smem_size = calc_layer0_smem_size(ef, sw, idx.max_degree0(),
+                                           static_cast<int>(idx.n_rows()));
 
   layer0_beam_search_kernel<<<num_queries, block_size, smem_size, stream>>>(
     d_queries_f, d_dataset_f, idx.d_layer0_graph, d_entry_points,
