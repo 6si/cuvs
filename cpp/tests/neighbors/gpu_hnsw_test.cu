@@ -303,29 +303,29 @@ INSTANTIATE_TEST_SUITE_P(
 // =============================================================================
 
 class GpuHnswScaleTest : public ::testing::TestWithParam<
-                           std::tuple<int, int, int, cuvs::distance::DistanceType>> {
+                           std::tuple<int, int, int, cuvs::distance::DistanceType, int>> {
  protected:
   void SetUp() override
   {
-    auto [n_rows, dim, k, metric] = GetParam();
-    n_rows_  = n_rows;
-    dim_     = dim;
-    k_       = k;
-    metric_  = metric;
-    n_queries_ = 100;
+    auto [n_rows, dim, k, metric, ef_construction] = GetParam();
+    n_rows_          = n_rows;
+    dim_             = dim;
+    k_               = k;
+    metric_          = metric;
+    ef_construction_ = ef_construction;
+    n_queries_       = 100;
   }
 
   int n_rows_;
   int dim_;
   int k_;
   int n_queries_;
+  int ef_construction_;
   cuvs::distance::DistanceType metric_;
 };
 
 /**
- * Scale test: Uses CPU HNSW recall as ground truth (brute force is too slow at N=2M).
- * GPU recall is compared against CPU HNSW recall rather than exact brute-force.
- * If GPU recall >= 0.95 * CPU recall, we consider it a pass.
+ * Scale test: Uses brute-force GT for N<=200K, CPU HNSW overlap for larger N.
  */
 TEST_P(GpuHnswScaleTest, ScaleRecallTest)
 {
@@ -356,13 +356,11 @@ TEST_P(GpuHnswScaleTest, ScaleRecallTest)
   }
 
   // --- Step 1: Build CPU HNSW ---
-  // ef_construction=50 (vs 200) for speed at large N. Recall is lower but
-  // sufficient to validate GPU search correctness vs CPU HNSW baseline.
-  std::cout << "  Building CPU HNSW (M=32, ef_construction=50, parallel)...\n";
+  std::cout << "  Building CPU HNSW (M=32, ef_construction=" << ef_construction_ << ", parallel)...\n";
   auto build_start = std::chrono::high_resolution_clock::now();
 
-  int M_build = 32;
-  int ef_construction = 50;
+  int M_build = 64;
+  int ef_construction = ef_construction_;
 
   auto hnsw_index = std::make_unique<cuvs::neighbors::hnsw::detail::index_impl<float>>(
     dim_, metric_, cuvs::neighbors::hnsw::HnswHierarchy::CPU);
@@ -427,8 +425,10 @@ TEST_P(GpuHnswScaleTest, ScaleRecallTest)
   auto d_neighbors = raft::make_device_matrix<uint64_t, int64_t>(res, n_queries_, k_);
   auto d_distances = raft::make_device_matrix<float, int64_t>(res, n_queries_, k_);
 
+  // ef scales with N: larger datasets need more beam candidates for 95%+ recall
+  int ef_search = (n_rows_ <= 200000) ? 800 : 400;
   cuvs::neighbors::gpu_hnsw::search_params search_params;
-  search_params.ef = 400;
+  search_params.ef = ef_search;
   search_params.search_width = 8;
 
   // Warmup
@@ -461,7 +461,7 @@ TEST_P(GpuHnswScaleTest, ScaleRecallTest)
   }
 
   // --- Step 5: CPU HNSW search (ground truth at scale) ---
-  cpu_hnsw->setEf(search_params.ef);
+  cpu_hnsw->setEf(ef_search);
 
   // Warmup
   cpu_hnsw->searchKnn(h_queries.data_handle(), k_);
@@ -481,44 +481,58 @@ TEST_P(GpuHnswScaleTest, ScaleRecallTest)
   auto t3 = std::chrono::high_resolution_clock::now();
   double cpu_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
 
-  // --- Step 6: Compare GPU vs CPU HNSW overlap ---
-  // At N=2M, brute force is too slow. Instead, check how many of GPU's top-k
-  // match CPU HNSW's top-k. Both are approximate, but CPU HNSW is the baseline.
-  int overlap_count = 0;
-  for (int q = 0; q < n_queries_; q++) {
-    for (int i = 0; i < k_; i++) {
-      int64_t gpu_id = static_cast<int64_t>(h_gpu_neighbors[q * k_ + i]);
-      for (int j = 0; j < k_; j++) {
-        if (h_cpu_neighbors[q * k_ + j] == gpu_id) {
-          overlap_count++;
-          break;
-        }
-      }
-    }
-  }
-  float overlap = static_cast<float>(overlap_count) / (n_queries_ * k_);
-
   std::cout << "  N=" << n_rows_ << " dim=" << dim_ << " k=" << k_
             << " metric=" << (use_ip ? "IP" : "L2") << "\n";
-  std::cout << "  GPU vs CPU HNSW overlap@" << k_ << " = " << overlap << "\n";
+
+  // --- Step 6: Compute recall vs appropriate ground truth ---
+  // Use brute-force GT for N<=200K (exact recall). For larger N, use CPU HNSW overlap.
   std::cout << "  GPU: " << gpu_ms << " ms for " << n_queries_ << " queries"
             << " (" << (n_queries_ / (gpu_ms / 1000.0)) << " QPS)\n";
   std::cout << "  CPU HNSW: " << cpu_ms << " ms for " << n_queries_ << " queries"
             << " (" << (n_queries_ / (cpu_ms / 1000.0)) << " QPS)\n";
   std::cout << "  Speedup: " << (cpu_ms / gpu_ms) << "x\n";
 
-  // GPU should find >=90% of the same neighbors as CPU HNSW
-  EXPECT_GT(overlap, 0.90f)
-    << "GPU vs CPU HNSW overlap@" << k_ << " = " << overlap
-    << " (expected > 0.90) with n_rows=" << n_rows_ << " dim=" << dim_;
+  if (n_rows_ <= 200000) {
+    std::vector<int64_t> h_gt_neighbors;
+    cpu_brute_force(h_dataset.data_handle(), h_queries.data_handle(),
+                    n_rows_, n_queries_, dim_, k_, h_gt_neighbors, use_ip);
+    std::vector<uint64_t> h_gpu_u64(h_gpu_neighbors.begin(), h_gpu_neighbors.end());
+    float recall = compute_recall(h_gt_neighbors, h_gpu_u64, n_queries_, k_);
+    std::vector<uint64_t> h_cpu_u64(n_queries_ * k_);
+    for (int i = 0; i < n_queries_ * k_; i++) h_cpu_u64[i] = static_cast<uint64_t>(h_cpu_neighbors[i]);
+    float cpu_recall = compute_recall(h_gt_neighbors, h_cpu_u64, n_queries_, k_);
+    std::cout << "  GPU Recall@" << k_ << " (vs brute force) = " << recall << "\n";
+    std::cout << "  CPU HNSW Recall@" << k_ << " (vs brute force) = " << cpu_recall << "\n";
+    EXPECT_GT(recall, 0.95f)
+      << "GPU Recall@" << k_ << " = " << recall << " (expected > 0.95)"
+      << " with n_rows=" << n_rows_ << " ef_construction=" << ef_construction_;
+  } else {
+    int overlap_count = 0;
+    for (int q = 0; q < n_queries_; q++) {
+      for (int i = 0; i < k_; i++) {
+        int64_t gpu_id = static_cast<int64_t>(h_gpu_neighbors[q * k_ + i]);
+        for (int j = 0; j < k_; j++) {
+          if (h_cpu_neighbors[q * k_ + j] == gpu_id) { overlap_count++; break; }
+        }
+      }
+    }
+    float overlap = static_cast<float>(overlap_count) / (n_queries_ * k_);
+    std::cout << "  GPU vs CPU HNSW overlap@" << k_ << " = " << overlap << "\n";
+    EXPECT_GT(overlap, 0.90f)
+      << "GPU vs CPU HNSW overlap@" << k_ << " = " << overlap
+      << " (expected > 0.90) with n_rows=" << n_rows_ << " ef_construction=" << ef_construction_;
+  }
 }
 
 INSTANTIATE_TEST_SUITE_P(
   GpuHnswScale,
   GpuHnswScaleTest,
   ::testing::Values(
-    // N=2M with 384-dim (production-like config)
-    std::make_tuple(2000000, 384, 10, cuvs::distance::DistanceType::L2Expanded)
+    // (n_rows, dim, k, metric, ef_construction)
+    // N=100K: brute-force GT, validates global bitmap (bitmap=12.5KB > smem limit)
+    std::make_tuple(100000, 384, 10, cuvs::distance::DistanceType::L2Expanded, 200),
+    // N=2M: production-scale, CPU HNSW overlap as GT
+    std::make_tuple(2000000, 384, 10, cuvs::distance::DistanceType::L2Expanded, 200)
   ));
 
 #endif  // CUVS_BUILD_CAGRA_HNSWLIB
