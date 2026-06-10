@@ -6,28 +6,73 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cstdint>
 #include <cfloat>
 
 namespace cuvs::neighbors::gpu_hnsw::detail {
 
 // ============================================================================
-// Distance computation helpers
+// Type conversion: T → float for distance accumulation
 // ============================================================================
+
+__device__ __forceinline__ float to_float(float val) { return val; }
+__device__ __forceinline__ float to_float(__half val) { return __half2float(val); }
+__device__ __forceinline__ float to_float(__nv_bfloat16 val) { return __bfloat162float(val); }
+__device__ __forceinline__ float to_float(int8_t val) { return static_cast<float>(val); }
+
+// ============================================================================
+// Distance computation helpers (templated on data type T)
+// ============================================================================
+
+/**
+ * Single-thread L2 squared distance.
+ * Loads T values, widens to float for accumulation.
+ * For float this compiles to identical code as the old non-templated version.
+ */
+template <typename T>
+__device__ __forceinline__ float thread_l2_distance(const T* __restrict__ a,
+                                                    const T* __restrict__ b,
+                                                    int dim)
+{
+  float sum = 0.0f;
+  for (int d = 0; d < dim; d++) {
+    float diff = to_float(a[d]) - to_float(b[d]);
+    sum += diff * diff;
+  }
+  return sum;
+}
+
+/**
+ * Single-thread inner product distance (negated for min-heap compatibility).
+ */
+template <typename T>
+__device__ __forceinline__ float thread_ip_distance(const T* __restrict__ a,
+                                                    const T* __restrict__ b,
+                                                    int dim)
+{
+  float sum = 0.0f;
+  for (int d = 0; d < dim; d++) {
+    sum += to_float(a[d]) * to_float(b[d]);
+  }
+  return -sum;
+}
 
 /**
  * Warp-cooperative L2 squared distance.
  * All 32 lanes compute partial sums over strided dimensions, then reduce via shuffle.
  * Only lane 0 holds the final result.
  */
-__device__ __forceinline__ float warp_l2_distance(const float* __restrict__ a,
-                                                  const float* __restrict__ b,
+template <typename T>
+__device__ __forceinline__ float warp_l2_distance(const T* __restrict__ a,
+                                                  const T* __restrict__ b,
                                                   int dim)
 {
   float partial = 0.0f;
   int lane      = threadIdx.x % 32;
   for (int d = lane; d < dim; d += 32) {
-    float diff = a[d] - b[d];
+    float diff = to_float(a[d]) - to_float(b[d]);
     partial += diff * diff;
   }
   for (int offset = 16; offset > 0; offset >>= 1) {
@@ -39,46 +84,20 @@ __device__ __forceinline__ float warp_l2_distance(const float* __restrict__ a,
 /**
  * Warp-cooperative inner product distance (negated for min-heap compatibility).
  */
-__device__ __forceinline__ float warp_ip_distance(const float* __restrict__ a,
-                                                  const float* __restrict__ b,
+template <typename T>
+__device__ __forceinline__ float warp_ip_distance(const T* __restrict__ a,
+                                                  const T* __restrict__ b,
                                                   int dim)
 {
   float partial = 0.0f;
   int lane      = threadIdx.x % 32;
   for (int d = lane; d < dim; d += 32) {
-    partial += a[d] * b[d];
+    partial += to_float(a[d]) * to_float(b[d]);
   }
   for (int offset = 16; offset > 0; offset >>= 1) {
     partial += __shfl_down_sync(0xffffffff, partial, offset);
   }
   return -partial;
-}
-
-/**
- * Single-thread distance computation (for use in block-parallel patterns
- * where each thread handles one candidate independently).
- */
-__device__ __forceinline__ float thread_l2_distance(const float* __restrict__ a,
-                                                    const float* __restrict__ b,
-                                                    int dim)
-{
-  float sum = 0.0f;
-  for (int d = 0; d < dim; d++) {
-    float diff = a[d] - b[d];
-    sum += diff * diff;
-  }
-  return sum;
-}
-
-__device__ __forceinline__ float thread_ip_distance(const float* __restrict__ a,
-                                                    const float* __restrict__ b,
-                                                    int dim)
-{
-  float sum = 0.0f;
-  for (int d = 0; d < dim; d++) {
-    sum += a[d] * b[d];
-  }
-  return -sum;
 }
 
 // ============================================================================
@@ -117,9 +136,10 @@ __device__ __forceinline__ uint32_t binary_search_node(const uint32_t* d_node_id
  * (no warp shuffle needed in the inner loop), then the warp reduces to find the
  * global best.
  */
+template <typename T>
 __global__ void upper_layer_search_kernel(
-  const float* __restrict__ d_queries,
-  const float* __restrict__ d_dataset,
+  const T* __restrict__ d_queries,
+  const T* __restrict__ d_dataset,
   const upper_layer_ptrs* __restrict__ d_layer_ptrs,
   uint32_t* __restrict__ d_entry_points,
   uint32_t global_entry_point,
@@ -132,15 +152,15 @@ __global__ void upper_layer_search_kernel(
   int lane    = threadIdx.x % 32;
   if (warp_id >= num_queries) return;
 
-  const float* query = d_queries + static_cast<int64_t>(warp_id) * dim;
+  const T* query = d_queries + static_cast<int64_t>(warp_id) * dim;
   uint32_t current   = global_entry_point;
 
   float best_dist;
   if (lane == 0) {
     if (use_inner_product) {
-      best_dist = thread_ip_distance(query, d_dataset + static_cast<int64_t>(current) * dim, dim);
+      best_dist = thread_ip_distance<T>(query, d_dataset + static_cast<int64_t>(current) * dim, dim);
     } else {
-      best_dist = thread_l2_distance(query, d_dataset + static_cast<int64_t>(current) * dim, dim);
+      best_dist = thread_l2_distance<T>(query, d_dataset + static_cast<int64_t>(current) * dim, dim);
     }
   }
   best_dist = __shfl_sync(0xffffffff, best_dist, 0);
@@ -166,11 +186,11 @@ __global__ void upper_layer_search_kernel(
         uint32_t nbr = lp.d_neighbors[static_cast<int64_t>(local_idx) * lp.max_degree + j];
         float dist = FLT_MAX;
         if (nbr != UINT32_MAX) {
-          const float* nbr_vec = d_dataset + static_cast<int64_t>(nbr) * dim;
+          const T* nbr_vec = d_dataset + static_cast<int64_t>(nbr) * dim;
           if (use_inner_product) {
-            dist = thread_ip_distance(query, nbr_vec, dim);
+            dist = thread_ip_distance<T>(query, nbr_vec, dim);
           } else {
-            dist = thread_l2_distance(query, nbr_vec, dim);
+            dist = thread_l2_distance<T>(query, nbr_vec, dim);
           }
         }
         if (dist < best_nbr_dist) {
@@ -244,9 +264,10 @@ __device__ __forceinline__ bool bitmap_visit(uint32_t* bitmap,
  *   together with (id, dist), keeping expansion state correct regardless of
  *   insertion position.
  */
+template <typename T>
 __global__ void layer0_beam_search_kernel(
-  const float* __restrict__ d_queries,
-  const float* __restrict__ d_dataset,
+  const T* __restrict__ d_queries,
+  const T* __restrict__ d_dataset,
   const uint32_t* __restrict__ d_layer0_graph,
   const uint32_t* __restrict__ d_entry_points,
   uint32_t* __restrict__ d_visited_bitmaps,  // [num_queries x bitmap_words], pre-zeroed
@@ -265,7 +286,7 @@ __global__ void layer0_beam_search_kernel(
   int query_idx = blockIdx.x;
   if (query_idx >= num_queries) return;
 
-  const float* query = d_queries + static_cast<int64_t>(query_idx) * dim;
+  const T* query = d_queries + static_cast<int64_t>(query_idx) * dim;
 
   // --- Shared memory layout ---
   extern __shared__ char smem[];
@@ -305,9 +326,9 @@ __global__ void layer0_beam_search_kernel(
   if (threadIdx.x == 0) {
     float ep_dist;
     if (use_inner_product) {
-      ep_dist = thread_ip_distance(query, d_dataset + static_cast<int64_t>(ep) * dim, dim);
+      ep_dist = thread_ip_distance<T>(query, d_dataset + static_cast<int64_t>(ep) * dim, dim);
     } else {
-      ep_dist = thread_l2_distance(query, d_dataset + static_cast<int64_t>(ep) * dim, dim);
+      ep_dist = thread_l2_distance<T>(query, d_dataset + static_cast<int64_t>(ep) * dim, dim);
     }
     result_ids[0]   = ep;
     result_dists[0] = ep_dist;
@@ -328,9 +349,9 @@ __global__ void layer0_beam_search_kernel(
 
     float dist;
     if (use_inner_product) {
-      dist = thread_ip_distance(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
+      dist = thread_ip_distance<T>(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
     } else {
-      dist = thread_l2_distance(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
+      dist = thread_l2_distance<T>(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
     }
 
     int slot = atomicAdd(&meta[1], 1);
@@ -415,9 +436,9 @@ __global__ void layer0_beam_search_kernel(
 
       float dist;
       if (use_inner_product) {
-        dist = thread_ip_distance(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
+        dist = thread_ip_distance<T>(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
       } else {
-        dist = thread_l2_distance(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
+        dist = thread_l2_distance<T>(query, d_dataset + static_cast<int64_t>(nbr) * dim, dim);
       }
 
       int slot = atomicAdd(&meta[1], 1);

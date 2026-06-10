@@ -535,4 +535,289 @@ INSTANTIATE_TEST_SUITE_P(
     std::make_tuple(2000000, 384, 10, cuvs::distance::DistanceType::L2Expanded, 200)
   ));
 
+// =============================================================================
+// Quantization tests: F16, BF16, INT8
+// =============================================================================
+
+/**
+ * Tests that quantized GPU HNSW search produces acceptable recall.
+ * Flow: build float HNSW on CPU → convert to quantized GPU index via
+ * from_hnsw_index_quantized<QuantT> → quantize queries → search → measure recall.
+ *
+ * Expected: F16/BF16 recall very close to float32; INT8 has more quantization
+ * loss but should still exceed 80% recall at N=10K.
+ */
+
+// Helper: quantize float queries to __half on host, then upload
+static void quantize_queries_f16(raft::resources& res,
+                                 const float* h_queries,
+                                 int n_queries,
+                                 int dim,
+                                 raft::device_matrix<__half, int64_t, raft::row_major>& d_out)
+{
+  std::vector<__half> h_q(n_queries * dim);
+  for (int i = 0; i < n_queries * dim; i++) {
+    h_q[i] = __float2half_rn(h_queries[i]);
+  }
+  raft::copy(d_out.data_handle(), reinterpret_cast<const __half*>(h_q.data()),
+             n_queries * dim, raft::resource::get_cuda_stream(res));
+}
+
+static void quantize_queries_bf16(raft::resources& res,
+                                  const float* h_queries,
+                                  int n_queries,
+                                  int dim,
+                                  raft::device_matrix<__nv_bfloat16, int64_t, raft::row_major>& d_out)
+{
+  std::vector<__nv_bfloat16> h_q(n_queries * dim);
+  for (int i = 0; i < n_queries * dim; i++) {
+    h_q[i] = __float2bfloat16_rn(h_queries[i]);
+  }
+  raft::copy(d_out.data_handle(), reinterpret_cast<const __nv_bfloat16*>(h_q.data()),
+             n_queries * dim, raft::resource::get_cuda_stream(res));
+}
+
+static void quantize_queries_int8(raft::resources& res,
+                                  const float* h_queries,
+                                  int n_queries,
+                                  int dim,
+                                  raft::device_matrix<int8_t, int64_t, raft::row_major>& d_out)
+{
+  // Symmetric quantization matching the dataset quantization
+  float max_abs = 0.0f;
+  for (int i = 0; i < n_queries * dim; i++) {
+    float a = std::fabs(h_queries[i]);
+    if (a > max_abs) max_abs = a;
+  }
+  float scale = (max_abs > 0.0f) ? (127.0f / max_abs) : 1.0f;
+  std::vector<int8_t> h_q(n_queries * dim);
+  for (int i = 0; i < n_queries * dim; i++) {
+    float scaled = h_queries[i] * scale;
+    scaled       = std::max(-127.0f, std::min(127.0f, scaled));
+    h_q[i]      = static_cast<int8_t>(std::roundf(scaled));
+  }
+  raft::copy(d_out.data_handle(), h_q.data(),
+             n_queries * dim, raft::resource::get_cuda_stream(res));
+}
+
+// --- F16 Test ---
+TEST(GpuHnswQuantF16Test, RecallTest)
+{
+  raft::resources res;
+  int n_rows    = 10000;
+  int dim       = 128;
+  int k         = 10;
+  int n_queries = 100;
+
+  // Generate random float dataset + queries
+  auto h_dataset = raft::make_host_matrix<float, int64_t>(n_rows, dim);
+  {
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (int64_t i = 0; i < static_cast<int64_t>(n_rows) * dim; i++)
+      h_dataset.data_handle()[i] = dist(rng);
+  }
+  auto h_queries = raft::make_host_matrix<float, int64_t>(n_queries, dim);
+  {
+    std::mt19937 rng(123);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (int64_t i = 0; i < n_queries * dim; i++)
+      h_queries.data_handle()[i] = dist(rng);
+  }
+
+  // Build float HNSW on CPU
+  auto hnsw_index = std::make_unique<cuvs::neighbors::hnsw::detail::index_impl<float>>(
+    dim, cuvs::distance::DistanceType::L2Expanded, cuvs::neighbors::hnsw::HnswHierarchy::CPU);
+  auto hnsw_alg = std::make_unique<hnswlib::HierarchicalNSW<float>>(
+    hnsw_index->get_space(), n_rows, 32, 200);
+  for (int64_t i = 0; i < n_rows; i++)
+    hnsw_alg->addPoint(h_dataset.data_handle() + i * dim, i);
+  hnsw_index->set_index(std::move(hnsw_alg));
+
+  // Convert to F16 GPU index
+  auto gpu_idx = cuvs::neighbors::gpu_hnsw::from_hnsw_index_quantized<__half>(
+    res, *hnsw_index, raft::make_const_mdspan(h_dataset.view()));
+  ASSERT_NE(gpu_idx, nullptr);
+
+  size_t f16_bytes = static_cast<size_t>(n_rows) * dim * sizeof(__half);
+  size_t f32_bytes = static_cast<size_t>(n_rows) * dim * sizeof(float);
+  std::cout << "  [F16] Dataset memory: " << f16_bytes / (1024.0 * 1024.0) << " MB"
+            << " (vs float32: " << f32_bytes / (1024.0 * 1024.0) << " MB,"
+            << " " << (static_cast<double>(f32_bytes) / f16_bytes) << "x savings)\n";
+
+  // Quantize queries and upload
+  auto d_queries_f16 = raft::make_device_matrix<__half, int64_t>(res, n_queries, dim);
+  quantize_queries_f16(res, h_queries.data_handle(), n_queries, dim, d_queries_f16);
+
+  // GPU search
+  auto d_neighbors = raft::make_device_matrix<uint64_t, int64_t>(res, n_queries, k);
+  auto d_distances = raft::make_device_matrix<float, int64_t>(res, n_queries, k);
+
+  cuvs::neighbors::gpu_hnsw::search_params sp;
+  sp.ef           = 200;
+  sp.search_width = 4;
+
+  cuvs::neighbors::gpu_hnsw::search<__half>(
+    res, sp, *gpu_idx,
+    raft::make_const_mdspan(d_queries_f16.view()),
+    d_neighbors.view(), d_distances.view());
+
+  std::vector<uint64_t> h_gpu_neighbors(n_queries * k);
+  raft::copy(h_gpu_neighbors.data(), d_neighbors.data_handle(),
+             n_queries * k, raft::resource::get_cuda_stream(res));
+  raft::resource::sync_stream(res);
+
+  // Ground truth (brute force on float)
+  std::vector<int64_t> h_gt;
+  cpu_brute_force(h_dataset.data_handle(), h_queries.data_handle(),
+                  n_rows, n_queries, dim, k, h_gt, false);
+
+  float recall = compute_recall(h_gt, h_gpu_neighbors, n_queries, k);
+  std::cout << "  [F16] Recall@" << k << " = " << recall << "\n";
+  EXPECT_GT(recall, 0.90f) << "F16 recall too low: " << recall;
+}
+
+// --- BF16 Test ---
+TEST(GpuHnswQuantBF16Test, RecallTest)
+{
+  raft::resources res;
+  int n_rows    = 10000;
+  int dim       = 128;
+  int k         = 10;
+  int n_queries = 100;
+
+  auto h_dataset = raft::make_host_matrix<float, int64_t>(n_rows, dim);
+  {
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (int64_t i = 0; i < static_cast<int64_t>(n_rows) * dim; i++)
+      h_dataset.data_handle()[i] = dist(rng);
+  }
+  auto h_queries = raft::make_host_matrix<float, int64_t>(n_queries, dim);
+  {
+    std::mt19937 rng(123);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (int64_t i = 0; i < n_queries * dim; i++)
+      h_queries.data_handle()[i] = dist(rng);
+  }
+
+  auto hnsw_index = std::make_unique<cuvs::neighbors::hnsw::detail::index_impl<float>>(
+    dim, cuvs::distance::DistanceType::L2Expanded, cuvs::neighbors::hnsw::HnswHierarchy::CPU);
+  auto hnsw_alg = std::make_unique<hnswlib::HierarchicalNSW<float>>(
+    hnsw_index->get_space(), n_rows, 32, 200);
+  for (int64_t i = 0; i < n_rows; i++)
+    hnsw_alg->addPoint(h_dataset.data_handle() + i * dim, i);
+  hnsw_index->set_index(std::move(hnsw_alg));
+
+  auto gpu_idx = cuvs::neighbors::gpu_hnsw::from_hnsw_index_quantized<__nv_bfloat16>(
+    res, *hnsw_index, raft::make_const_mdspan(h_dataset.view()));
+  ASSERT_NE(gpu_idx, nullptr);
+
+  size_t bf16_bytes = static_cast<size_t>(n_rows) * dim * sizeof(__nv_bfloat16);
+  size_t f32_bytes  = static_cast<size_t>(n_rows) * dim * sizeof(float);
+  std::cout << "  [BF16] Dataset memory: " << bf16_bytes / (1024.0 * 1024.0) << " MB"
+            << " (vs float32: " << f32_bytes / (1024.0 * 1024.0) << " MB,"
+            << " " << (static_cast<double>(f32_bytes) / bf16_bytes) << "x savings)\n";
+
+  auto d_queries_bf16 = raft::make_device_matrix<__nv_bfloat16, int64_t>(res, n_queries, dim);
+  quantize_queries_bf16(res, h_queries.data_handle(), n_queries, dim, d_queries_bf16);
+
+  auto d_neighbors = raft::make_device_matrix<uint64_t, int64_t>(res, n_queries, k);
+  auto d_distances = raft::make_device_matrix<float, int64_t>(res, n_queries, k);
+
+  cuvs::neighbors::gpu_hnsw::search_params sp;
+  sp.ef           = 200;
+  sp.search_width = 4;
+
+  cuvs::neighbors::gpu_hnsw::search<__nv_bfloat16>(
+    res, sp, *gpu_idx,
+    raft::make_const_mdspan(d_queries_bf16.view()),
+    d_neighbors.view(), d_distances.view());
+
+  std::vector<uint64_t> h_gpu_neighbors(n_queries * k);
+  raft::copy(h_gpu_neighbors.data(), d_neighbors.data_handle(),
+             n_queries * k, raft::resource::get_cuda_stream(res));
+  raft::resource::sync_stream(res);
+
+  std::vector<int64_t> h_gt;
+  cpu_brute_force(h_dataset.data_handle(), h_queries.data_handle(),
+                  n_rows, n_queries, dim, k, h_gt, false);
+
+  float recall = compute_recall(h_gt, h_gpu_neighbors, n_queries, k);
+  std::cout << "  [BF16] Recall@" << k << " = " << recall << "\n";
+  EXPECT_GT(recall, 0.90f) << "BF16 recall too low: " << recall;
+}
+
+// --- INT8 Test ---
+TEST(GpuHnswQuantINT8Test, RecallTest)
+{
+  raft::resources res;
+  int n_rows    = 10000;
+  int dim       = 128;
+  int k         = 10;
+  int n_queries = 100;
+
+  auto h_dataset = raft::make_host_matrix<float, int64_t>(n_rows, dim);
+  {
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (int64_t i = 0; i < static_cast<int64_t>(n_rows) * dim; i++)
+      h_dataset.data_handle()[i] = dist(rng);
+  }
+  auto h_queries = raft::make_host_matrix<float, int64_t>(n_queries, dim);
+  {
+    std::mt19937 rng(123);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (int64_t i = 0; i < n_queries * dim; i++)
+      h_queries.data_handle()[i] = dist(rng);
+  }
+
+  auto hnsw_index = std::make_unique<cuvs::neighbors::hnsw::detail::index_impl<float>>(
+    dim, cuvs::distance::DistanceType::L2Expanded, cuvs::neighbors::hnsw::HnswHierarchy::CPU);
+  auto hnsw_alg = std::make_unique<hnswlib::HierarchicalNSW<float>>(
+    hnsw_index->get_space(), n_rows, 32, 200);
+  for (int64_t i = 0; i < n_rows; i++)
+    hnsw_alg->addPoint(h_dataset.data_handle() + i * dim, i);
+  hnsw_index->set_index(std::move(hnsw_alg));
+
+  auto gpu_idx = cuvs::neighbors::gpu_hnsw::from_hnsw_index_quantized<int8_t>(
+    res, *hnsw_index, raft::make_const_mdspan(h_dataset.view()));
+  ASSERT_NE(gpu_idx, nullptr);
+
+  size_t i8_bytes  = static_cast<size_t>(n_rows) * dim * sizeof(int8_t);
+  size_t f32_bytes = static_cast<size_t>(n_rows) * dim * sizeof(float);
+  std::cout << "  [INT8] Dataset memory: " << i8_bytes / (1024.0 * 1024.0) << " MB"
+            << " (vs float32: " << f32_bytes / (1024.0 * 1024.0) << " MB,"
+            << " " << (static_cast<double>(f32_bytes) / i8_bytes) << "x savings)\n";
+
+  auto d_queries_i8 = raft::make_device_matrix<int8_t, int64_t>(res, n_queries, dim);
+  quantize_queries_int8(res, h_queries.data_handle(), n_queries, dim, d_queries_i8);
+
+  auto d_neighbors = raft::make_device_matrix<uint64_t, int64_t>(res, n_queries, k);
+  auto d_distances = raft::make_device_matrix<float, int64_t>(res, n_queries, k);
+
+  cuvs::neighbors::gpu_hnsw::search_params sp;
+  sp.ef           = 200;
+  sp.search_width = 4;
+
+  cuvs::neighbors::gpu_hnsw::search<int8_t>(
+    res, sp, *gpu_idx,
+    raft::make_const_mdspan(d_queries_i8.view()),
+    d_neighbors.view(), d_distances.view());
+
+  std::vector<uint64_t> h_gpu_neighbors(n_queries * k);
+  raft::copy(h_gpu_neighbors.data(), d_neighbors.data_handle(),
+             n_queries * k, raft::resource::get_cuda_stream(res));
+  raft::resource::sync_stream(res);
+
+  std::vector<int64_t> h_gt;
+  cpu_brute_force(h_dataset.data_handle(), h_queries.data_handle(),
+                  n_rows, n_queries, dim, k, h_gt, false);
+
+  float recall = compute_recall(h_gt, h_gpu_neighbors, n_queries, k);
+  std::cout << "  [INT8] Recall@" << k << " = " << recall << "\n";
+  // INT8 has significant quantization loss — 80% threshold is reasonable
+  EXPECT_GT(recall, 0.80f) << "INT8 recall too low: " << recall;
+}
+
 #endif  // CUVS_BUILD_CAGRA_HNSWLIB

@@ -13,6 +13,8 @@
 #include <raft/core/host_mdspan.hpp>
 #include <raft/core/resources.hpp>
 
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -193,6 +195,30 @@ void search(raft::resources const& res,
             raft::device_matrix_view<const T, int64_t, raft::row_major> queries,
             raft::device_matrix_view<uint64_t, int64_t, raft::row_major> neighbors,
             raft::device_matrix_view<float, int64_t, raft::row_major> distances);
+
+/**
+ * @brief Convert a float CPU HNSW index to a quantized GPU HNSW index.
+ *
+ * Extracts the multi-layer graph, quantizes the float dataset to QuantT,
+ * and uploads to device memory. The graph structure (uint32_t neighbor IDs)
+ * is unchanged; only the dataset vectors are quantized.
+ *
+ * Supported QuantT: __half (FP16), __nv_bfloat16 (BF16), int8_t (INT8).
+ *
+ * For INT8, symmetric quantization is applied: each dimension is scaled
+ * by max(abs(values)) / 127 across the dataset.
+ *
+ * @tparam QuantT quantized data type for GPU storage
+ * @param[in] res raft resources
+ * @param[in] hnsw_index the CPU HNSW index (built with float data)
+ * @param[in] dataset the float dataset vectors on host [n_rows, dim], row-major
+ * @return a GPU HNSW index with quantized dataset ready for search
+ */
+template <typename QuantT>
+std::unique_ptr<index<QuantT>> from_hnsw_index_quantized(
+  raft::resources const& res,
+  const cuvs::neighbors::hnsw::index<float>& hnsw_index,
+  raft::host_matrix_view<const float, int64_t, raft::row_major> dataset);
 
 /**
  * @}

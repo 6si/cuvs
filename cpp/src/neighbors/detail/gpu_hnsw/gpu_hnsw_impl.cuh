@@ -39,11 +39,8 @@ void search_impl(raft::resources const& res,
 
   bool use_ip = (idx.metric() == cuvs::distance::DistanceType::InnerProduct);
 
-  static_assert(std::is_same_v<T, float>,
-                "GPU HNSW search currently only supports float data type");
-
-  const float* d_queries_f = reinterpret_cast<const float*>(queries.data_handle());
-  const float* d_dataset_f = reinterpret_cast<const float*>(idx.d_dataset);
+  const T* d_queries_t = queries.data_handle();
+  const T* d_dataset_t = idx.d_dataset;
 
   uint32_t* d_entry_points = nullptr;
   RAFT_CUDA_TRY(cudaMalloc(&d_entry_points, num_queries * sizeof(uint32_t)));
@@ -67,8 +64,8 @@ void search_impl(raft::resources const& res,
     int threads_per_block = warps_per_block * 32;
     int num_blocks        = (num_queries + warps_per_block - 1) / warps_per_block;
 
-    upper_layer_search_kernel<<<num_blocks, threads_per_block, 0, stream>>>(
-      d_queries_f, d_dataset_f, d_layer_ptrs, d_entry_points,
+    upper_layer_search_kernel<T><<<num_blocks, threads_per_block, 0, stream>>>(
+      d_queries_t, d_dataset_t, d_layer_ptrs, d_entry_points,
       idx.entry_point(), num_queries, dim, num_upper_layers, use_ip);
 
     RAFT_CUDA_TRY(cudaFree(d_layer_ptrs));
@@ -90,8 +87,8 @@ void search_impl(raft::resources const& res,
   RAFT_CUDA_TRY(cudaMalloc(&d_visited_bitmaps, bitmap_bytes));
   RAFT_CUDA_TRY(cudaMemsetAsync(d_visited_bitmaps, 0, bitmap_bytes, stream));
 
-  layer0_beam_search_kernel<<<num_queries, block_size, smem_size, stream>>>(
-    d_queries_f, d_dataset_f, idx.d_layer0_graph, d_entry_points,
+  layer0_beam_search_kernel<T><<<num_queries, block_size, smem_size, stream>>>(
+    d_queries_t, d_dataset_t, idx.d_layer0_graph, d_entry_points,
     d_visited_bitmaps,
     neighbors.data_handle(), distances.data_handle(),
     num_queries, N_int, dim, idx.max_degree0(),
