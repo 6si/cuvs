@@ -8,10 +8,16 @@
  * @brief Test for GPU HNSW search.
  *
  * This test:
- *   1. Builds a CPU HNSW index using cuvs::neighbors::hnsw::build
- *   2. Converts it to GPU HNSW index using cuvs::neighbors::gpu_hnsw::from_hnsw_index
- *   3. Runs GPU HNSW search
- *   4. Compares recall against brute-force ground truth
+ *   1. Builds a CPU HNSW index directly using hnswlib (full hierarchy)
+ *   2. Wraps it in a cuvs::neighbors::hnsw::index via index_impl
+ *   3. Converts it to GPU HNSW index using cuvs::neighbors::gpu_hnsw::from_hnsw_index
+ *   4. Runs GPU HNSW search
+ *   5. Compares recall against brute-force ground truth
+ *
+ * We build hnswlib directly instead of going through hnsw::build() because
+ * hnsw::build() routes through CAGRA → from_cagra, and the HnswHierarchy::CPU
+ * path in from_cagra hangs. Direct hnswlib build is also what Milvus/Knowhere
+ * does in production, so this better mirrors the real integration.
  */
 
 #ifdef CUVS_BUILD_CAGRA_HNSWLIB
@@ -21,6 +27,12 @@
 #include <cuvs/neighbors/gpu_hnsw.hpp>
 #include <cuvs/neighbors/hnsw.hpp>
 #include <cuvs/neighbors/brute_force.hpp>
+
+// Internal detail header to access index_impl (needed to wrap raw hnswlib index)
+#include "../../src/neighbors/detail/hnsw.hpp"
+
+#include <hnswlib/hnswalg.h>
+#include <hnswlib/hnswlib.h>
 
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/host_mdarray.hpp>
@@ -103,15 +115,27 @@ TEST_P(GpuHnswSearchTest, RecallTest)
     }
   }
 
-  // --- Step 1: Build CPU HNSW index ---
-  cuvs::neighbors::hnsw::index_params hnsw_params;
-  hnsw_params.metric         = metric_;
-  hnsw_params.M              = 32;
-  hnsw_params.ef_construction = 200;
-  hnsw_params.hierarchy      = cuvs::neighbors::hnsw::HnswHierarchy::NONE;
+  // --- Step 1: Build CPU HNSW index directly via hnswlib (full hierarchy) ---
+  // We build hnswlib directly instead of hnsw::build() to avoid the CAGRA→from_cagra
+  // pipeline (which hangs with HnswHierarchy::CPU). This also matches the Milvus
+  // production flow where hnswlib builds the index natively.
+  constexpr int M = 32;
+  constexpr int ef_construction = 200;
 
-  auto hnsw_index = cuvs::neighbors::hnsw::build(
-    res, hnsw_params, raft::make_const_mdspan(h_dataset.view()));
+  auto hnsw_index = std::make_unique<cuvs::neighbors::hnsw::detail::index_impl<float>>(
+    dim_, metric_, cuvs::neighbors::hnsw::HnswHierarchy::CPU);
+
+  auto hnsw_alg = std::make_unique<hnswlib::HierarchicalNSW<float>>(
+    hnsw_index->get_space(), n_rows_, M, ef_construction);
+
+  // Insert all vectors (sequential — hnswlib addPoint is not fully thread-safe
+  // for concurrent inserts at small N, and we're testing correctness not build speed)
+  for (int64_t i = 0; i < n_rows_; i++) {
+    hnsw_alg->addPoint(
+      static_cast<const void*>(h_dataset.data_handle() + i * dim_), i);
+  }
+
+  hnsw_index->set_index(std::move(hnsw_alg));
   ASSERT_NE(hnsw_index, nullptr);
 
   // --- Step 2: Convert to GPU HNSW index ---
